@@ -1,0 +1,4 @@
+mcp[server]
+pywin32
+Pillow
+python-dotenv
