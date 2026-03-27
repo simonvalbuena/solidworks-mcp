@@ -35,7 +35,7 @@ Claude Code（有網路電腦）    SW 主機（僅區網）
 ## 專案結構
 
 ```
-solidwork-mcp/
+solidworks-mcp/
 ├── server.py          # MCP server 入口（Streamable HTTP transport）
 ├── sw_connection.py   # SolidWorks COM 連線管理
 ├── tools/

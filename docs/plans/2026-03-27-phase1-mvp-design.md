@@ -38,7 +38,7 @@ Claude Code（有網路電腦）         SW 主機（僅區網）
 ## 專案結構
 
 ```
-solidwork-mcp/
+solidworks-mcp/
 ├── .env.example           # 設定範本（commit 進 repo）
 ├── .env                   # 實際設定（gitignore）
 ├── .gitignore
