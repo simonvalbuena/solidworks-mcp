@@ -1,6 +1,16 @@
 """測試 export 的截圖模式判斷邏輯（不需要 SolidWorks）。"""
 
-from tools.export import should_use_base64
+import pytest
+
+try:
+    from tools.export import should_use_base64
+    HAS_DEPS = True
+except ImportError:
+    HAS_DEPS = False
+
+pytestmark = pytest.mark.skipif(
+    not HAS_DEPS, reason="需要 pywin32（僅在 SW 主機上可用）"
+)
 
 MAX_SIZE = 1 * 1024 * 1024  # 1MB
 

@@ -3,8 +3,17 @@
 import asyncio
 import pytest
 from unittest.mock import patch, MagicMock
-from sw_connection import SWConnection
-from errors import SWTimeoutError
+
+try:
+    from sw_connection import SWConnection
+    from errors import SWTimeoutError
+    HAS_PYWIN32 = True
+except ImportError:
+    HAS_PYWIN32 = False
+
+pytestmark = pytest.mark.skipif(
+    not HAS_PYWIN32, reason="需要 pywin32（僅在 SW 主機上可用）"
+)
 
 
 @pytest.fixture
