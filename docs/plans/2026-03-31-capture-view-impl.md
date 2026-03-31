@@ -1,22 +1,24 @@
-"""輸出 tools — 截圖、PDF、儲存 Drawing。"""
+# capture_view Implementation Plan
 
-from __future__ import annotations
+Goal: 在 export.py 新增 capture_view tool，從 3D 模型截取多角度標準視圖截圖存 SMB。
 
-import json
-import logging
-import os
-import shutil
-import tempfile
-from datetime import datetime
+Architecture: 追加到現有 `src/tools/export.py`，複用 `_bmp_to_jpeg`、`_server_to_client_path` 等現有函式。ShowNamedView2 設視角 → ViewZoomtofit2 → SaveBMP → JPEG → SMB。
 
-from mcp.server.fastmcp import FastMCP
+Tech Stack: pywin32 COM, PIL/Pillow, FastMCP
 
-import config
-from errors import SWError, ToolError
-from sw_connection import SWConnection
+---
 
-logger = logging.getLogger(__name__)
+### Task 1: 常數與驗證函式 + 測試
 
+Files:
+- Modify: `src/tools/export.py:1-3`（新增常數和驗證函式）
+- Modify: `tests/test_export_logic.py`（新增測試）
+
+Step 1: 在 `src/tools/export.py` 頂部（`SW_SAVE_AS_CURRENT_VERSION` 之前）新增常數和驗證函式
+
+在 `logger = logging.getLogger(__name__)` 之後、`SW_SAVE_AS_CURRENT_VERSION` 之前插入：
+
+```python
 STANDARD_VIEWS = {
     "front":      1,   # swFrontView
     "back":       2,   # swBackView
@@ -46,51 +48,113 @@ def validate_views(views: list[str]) -> tuple[list[str], list[str]]:
         else:
             invalid.append(v)
     return valid, invalid
+```
+
+Step 2: 在 `tests/test_export_logic.py` 追加測試
+
+修改 import 區塊，新增匯入：
+
+```python
+try:
+    from tools.export import (
+        should_use_base64,
+        STANDARD_VIEWS,
+        DEFAULT_VIEWS,
+        validate_views,
+    )
+    HAS_DEPS = True
+except ImportError:
+    HAS_DEPS = False
+```
+
+在檔案末尾追加：
+
+```python
+class TestStandardViews:
+
+    def test_all_nine_views_present(self):
+        expected = {"front", "back", "top", "bottom", "left", "right",
+                    "isometric", "dimetric", "trimetric"}
+        assert set(STANDARD_VIEWS.keys()) == expected
+
+    def test_enum_values_are_unique(self):
+        values = list(STANDARD_VIEWS.values())
+        assert len(values) == len(set(values))
+
+    def test_enum_values_range(self):
+        for name, val in STANDARD_VIEWS.items():
+            assert 1 <= val <= 9, f"{name} has invalid enum value {val}"
 
 
-SW_SAVE_AS_CURRENT_VERSION = 0
-SW_SAVE_WITH_REFERENCES_NO = 0
-SW_SAVE_AS_OPTIONS_SILENT = 1
+class TestDefaultViews:
+
+    def test_default_views_are_valid(self):
+        for v in DEFAULT_VIEWS:
+            assert v in STANDARD_VIEWS
+
+    def test_default_views_count(self):
+        assert len(DEFAULT_VIEWS) == 4
 
 
-def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
+class TestValidateViews:
 
-    @mcp.tool()
-    async def capture_drawing(
-        resolution: str = "low",
-    ) -> str:
-        """截取目前 Drawing 畫面，存為 JPEG 回傳檔案路徑。
-        resolution: low（800px）/ high（2000px）。
-        回傳路徑可用 Read tool 查看截圖。"""
-        try:
-            result = await sw.execute(
-                _capture_drawing,
-                resolution,
-            )
-            return json.dumps(result, ensure_ascii=False)
-        except SWError as e:
-            raise ToolError(f"capture_drawing 失敗: {e}")
+    def test_all_valid(self):
+        valid, invalid = validate_views(["front", "top", "isometric"])
+        assert valid == ["front", "top", "isometric"]
+        assert invalid == []
 
-    @mcp.tool()
-    async def save_as_pdf(output_path: str | None = None) -> str:
-        """將目前的 Drawing 輸出為 PDF。
-        output_path: 輸出路徑，預設存到 SMB 共享資料夾。"""
-        try:
-            result = await sw.execute(_save_as_pdf, output_path)
-            return json.dumps(result, ensure_ascii=False)
-        except SWError as e:
-            raise ToolError(f"save_as_pdf 失敗: {e}")
+    def test_mixed_valid_invalid(self):
+        valid, invalid = validate_views(["front", "diagonal", "top"])
+        assert valid == ["front", "top"]
+        assert invalid == ["diagonal"]
 
-    @mcp.tool()
-    async def save_drawing(file_path: str | None = None) -> str:
-        """儲存目前的 Drawing 文件（.slddrw）。
-        file_path: 另存路徑，預設覆蓋原檔。"""
-        try:
-            result = await sw.execute(_save_drawing, file_path)
-            return json.dumps(result, ensure_ascii=False)
-        except SWError as e:
-            raise ToolError(f"save_drawing 失敗: {e}")
+    def test_all_invalid(self):
+        valid, invalid = validate_views(["xxx", "yyy"])
+        assert valid == []
+        assert invalid == ["xxx", "yyy"]
 
+    def test_empty_list(self):
+        valid, invalid = validate_views([])
+        assert valid == []
+        assert invalid == []
+
+    def test_case_insensitive(self):
+        valid, invalid = validate_views(["Front", "TOP", "Isometric"])
+        assert valid == ["front", "top", "isometric"]
+        assert invalid == []
+
+    def test_deduplication(self):
+        valid, invalid = validate_views(["front", "front", "top"])
+        assert valid == ["front", "top"]
+        assert invalid == []
+
+    def test_whitespace_trimmed(self):
+        valid, invalid = validate_views(["  front  ", "top"])
+        assert valid == ["front", "top"]
+        assert invalid == []
+```
+
+Step 3: 跑測試確認通過
+
+Run: `.venv/Scripts/pytest tests/test_export_logic.py -v`
+Expected: PASS（原有 5 + 新增 12 = 17 tests）
+
+Step 4: Commit
+
+```
+feat: capture_view 常數與 validate_views 驗證函式
+```
+
+---
+
+### Task 2: capture_view COM 函式與 tool handler
+
+Files:
+- Modify: `src/tools/export.py`（register_tools 內新增 tool handler + 新增 _capture_view 函式）
+
+Step 1: 在 `register_tools` 函式內（`save_drawing` 之後）新增 tool handler
+
+```python
     @mcp.tool()
     async def capture_view(
         views: list[str] | None = None,
@@ -113,36 +177,11 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
             return json.dumps(result, ensure_ascii=False)
         except SWError as e:
             raise ToolError(f"capture_view 失敗: {e}")
+```
 
+Step 2: 在 `_capture_drawing` 函式之前新增 `_capture_view` 函式
 
-def should_use_base64(output_mode: str, file_size: int, max_size: int) -> bool:
-    """判斷截圖應使用 base64 或 SMB。供外部測試呼叫。"""
-    if output_mode == "base64":
-        return True
-    if output_mode == "smb":
-        return False
-    return file_size <= max_size
-
-
-JPEG_QUALITY = 85
-
-
-def _bmp_to_jpeg(bmp_path: str, jpeg_path: str) -> None:
-    """將 BMP 轉為 JPEG。"""
-    from PIL import Image
-
-    img = Image.open(bmp_path)
-    img = img.convert("RGB")
-    img.save(jpeg_path, "JPEG", quality=JPEG_QUALITY, optimize=True)
-
-
-def _server_to_client_path(server_path: str) -> str:
-    """將 server 端路徑轉為 client 端可存取的路徑。"""
-    if not config.SMB_CLIENT_PATH:
-        return server_path
-    return server_path.replace(config.SMB_SHARE_PATH, config.SMB_CLIENT_PATH, 1)
-
-
+```python
 def _capture_view(views: list[str], doc_name: str | None, resolution: str) -> dict:
     """COM 操作：多角度 3D 模型截圖。"""
     sw_conn = SWConnection.get_instance()
@@ -166,8 +205,6 @@ def _capture_view(views: list[str], doc_name: str | None, resolution: str) -> di
         if found is None:
             raise SWError(f"找不到文件: {doc_name}")
         doc = found
-        # SaveBMP 只能截取畫面上的活動文件，需先切換
-        app.ActivateDoc(doc.GetTitle)
 
     # --- 確認非 Drawing ---
     if doc.GetType == SW_DOC_DRAWING:
@@ -249,97 +286,26 @@ def _capture_view(views: list[str], doc_name: str | None, resolution: str) -> di
         "total_views": success_count,
         "captures": captures,
     }
+```
 
+Step 3: 跑測試確認沒破壞既有功能
 
-def _capture_drawing(resolution: str) -> dict:
-    sw_conn = SWConnection.get_instance()
-    doc = sw_conn.get_active_doc()
+Run: `.venv/Scripts/pytest tests/ -v`
+Expected: 全部 PASS
 
-    width = 800 if resolution == "low" else 2000
+Step 4: Commit
 
-    tmp_dir = tempfile.mkdtemp(prefix="sw_mcp_")
-    bmp_path = os.path.join(tmp_dir, "capture.bmp")
-    jpeg_path = os.path.join(tmp_dir, "capture.jpg")
+```
+feat: capture_view — 3D 模型多角度標準視圖截圖
+```
 
-    try:
-        doc.SaveBMP(bmp_path, width, 0)
+Step 5: 部署到 SW 主機實機測試
 
-        if not os.path.exists(bmp_path):
-            raise SWError("截圖失敗：SaveBMP 未產生檔案")
+Run: `bash deploy.sh`
 
-        _bmp_to_jpeg(bmp_path, jpeg_path)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        title = doc.GetTitle.replace(" ", "_")
-        smb_filename = f"{title}_{timestamp}.jpg"
-        smb_path = os.path.join(config.SMB_SHARE_PATH, smb_filename)
-
-        os.makedirs(config.SMB_SHARE_PATH, exist_ok=True)
-        shutil.copy2(jpeg_path, smb_path)
-
-        client_path = _server_to_client_path(smb_path)
-
-        return {
-            "path": client_path,
-            "size_bytes": os.path.getsize(smb_path),
-            "status": "saved",
-        }
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def _save_as_pdf(output_path: str | None) -> dict:
-    sw_conn = SWConnection.get_instance()
-    doc = sw_conn.get_active_doc()
-
-    if output_path is None:
-        title = doc.GetTitle.replace(" ", "_")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(
-            config.SMB_SHARE_PATH,
-            f"{title}_{timestamp}.pdf",
-        )
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    extension = doc.Extension
-    extension.SaveAs3(
-        output_path,
-        0,
-        0,
-    )
-
-    if not os.path.exists(output_path):
-        raise SWError(f"PDF 輸出失敗: {output_path}")
-
-    return {
-        "path": _server_to_client_path(output_path),
-        "size_bytes": os.path.getsize(output_path),
-        "status": "saved",
-    }
-
-
-def _save_drawing(file_path: str | None) -> dict:
-    sw_conn = SWConnection.get_instance()
-    doc = sw_conn.get_active_doc()
-
-    if file_path:
-        extension = doc.Extension
-        extension.SaveAs3(
-            file_path,
-            SW_SAVE_AS_CURRENT_VERSION,
-            SW_SAVE_WITH_REFERENCES_NO,
-        )
-        saved_path = file_path
-    else:
-        doc.Save3(
-            SW_SAVE_AS_OPTIONS_SILENT,
-            0,
-            0,
-        )
-        saved_path = doc.GetPathName
-
-    return {
-        "path": saved_path,
-        "status": "saved",
-    }
+實機測試項目：
+1. **ShowNamedView2 enum 值驗證** — 逐一呼叫 9 個 view，確認截圖方向正確
+2. ViewZoomtofit2 後模型是否完整
+3. JPEG 壓縮大小是否合理（< 300KB）
+4. 截完後視角是否回到 isometric
+5. Drawing 文件呼叫時是否正確回傳錯誤

@@ -27,11 +27,13 @@ def register_all_tools() -> None:
     from tools.drawing import register_tools as register_drawing
     from tools.annotation import register_tools as register_annotation
     from tools.export import register_tools as register_export
+    from tools.assembly import register_tools as register_assembly
 
     register_file_ops(mcp, sw)
     register_drawing(mcp, sw)
     register_annotation(mcp, sw)
     register_export(mcp, sw)
+    register_assembly(mcp, sw)
 
 
 register_all_tools()
