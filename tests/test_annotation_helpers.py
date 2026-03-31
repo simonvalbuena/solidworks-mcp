@@ -221,3 +221,107 @@ def test_find_bounding_edges_insufficient():
     }
     result = _find_bounding_edges(edges)
     assert result["h_top"] is None or result["h_top"] == result["h_bottom"]
+
+
+# --- circle dedup tests ---
+
+def test_dedupe_circles_same_radius_picks_farthest():
+    """同半徑 3 個圓，選離重心最遠的。"""
+    from tools.annotation import _dedupe_circles
+    # 3 個半徑 0.005m 的圓，圓心分別在 (0,0), (0.02,0), (0.05,0)
+    # 重心 x = (0 + 0.02 + 0.05) / 3 ≈ 0.0233
+    # 離重心最遠的是 (0.05, 0)
+    circles = [
+        ("edge_a", (0.0, 0.0, 0.0), 0.005),
+        ("edge_b", (0.02, 0.0, 0.0), 0.005),
+        ("edge_c", (0.05, 0.0, 0.0), 0.005),
+    ]
+    result = _dedupe_circles(circles)
+    assert len(result) == 1
+    assert result[0][0] == "edge_c"
+
+
+def test_dedupe_circles_different_radii_keeps_all():
+    """不同半徑各保留一個。"""
+    from tools.annotation import _dedupe_circles
+    circles = [
+        ("edge_a", (0.0, 0.0, 0.0), 0.005),
+        ("edge_b", (0.01, 0.0, 0.0), 0.010),
+        ("edge_c", (0.02, 0.0, 0.0), 0.003),
+    ]
+    result = _dedupe_circles(circles)
+    assert len(result) == 3
+
+
+def test_dedupe_circles_tolerance():
+    """半徑差 < 0.1mm (1e-4m) 視為同組。"""
+    from tools.annotation import _dedupe_circles
+    # 3 個圓：重心 x = (0 + 0.01 + 0.05) / 3 ≈ 0.02
+    # edge_c 離重心最遠 (|0.05 - 0.02| = 0.03)
+    circles = [
+        ("edge_a", (0.0, 0.0, 0.0), 0.00500),
+        ("edge_b", (0.01, 0.0, 0.0), 0.00509),  # 差 0.09mm < 0.1mm
+        ("edge_c", (0.05, 0.0, 0.0), 0.00504),  # 差 0.04mm < 0.1mm
+    ]
+    result = _dedupe_circles(circles)
+    assert len(result) == 1
+    assert result[0][0] == "edge_c"  # 離重心最遠
+
+
+def test_dedupe_circles_empty():
+    """空列表回傳空。"""
+    from tools.annotation import _dedupe_circles
+    assert _dedupe_circles([]) == []
+
+
+def test_dedupe_circles_single():
+    """只有一個圓，直接回傳。"""
+    from tools.annotation import _dedupe_circles
+    circles = [("edge_a", (0.0, 0.0, 0.0), 0.005)]
+    result = _dedupe_circles(circles)
+    assert len(result) == 1
+
+
+# --- circle classify → dedupe integration test ---
+
+def _make_mock_circle_edge_r(center, radius, full=True):
+    """建立模擬完整圓邊線（可自訂半徑）。"""
+    edge = MagicMock()
+    curve = MagicMock()
+    type(edge).GetCurve = property(lambda self: curve)
+    type(curve).IsLine = property(lambda self: False)
+    type(curve).IsCircle = property(lambda self: True)
+    type(curve).CircleParams = property(
+        lambda self, c=center, r=radius: (*c, 0, 0, 1, r),
+    )
+    if full:
+        type(edge).GetStartVertex = property(lambda self: None)
+        type(edge).GetEndVertex = property(lambda self: None)
+    else:
+        sv = MagicMock()
+        type(sv).GetPoint = property(lambda self: (0.01, 0, 0))
+        ev = MagicMock()
+        type(ev).GetPoint = property(lambda self: (-0.01, 0, 0))
+        type(edge).GetStartVertex = property(lambda self: sv)
+        type(edge).GetEndVertex = property(lambda self: ev)
+    return edge
+
+
+def test_dedupe_circles_mixed_with_classify():
+    """classify → dedupe 端到端：3 個同半徑圓 + 1 個不同半徑 → 2 個代表。"""
+    from tools.annotation import _classify_edges, _dedupe_circles
+    edges = [
+        _make_mock_circle_edge_r((0.0, 0.0, 0.0), 0.005),     # r=5mm, group A
+        _make_mock_circle_edge_r((0.02, 0.0, 0.0), 0.005),    # r=5mm, group A
+        _make_mock_circle_edge_r((0.04, 0.0, 0.0), 0.005),    # r=5mm, group A
+        _make_mock_circle_edge_r((0.01, 0.01, 0.0), 0.010),   # r=10mm, group B
+    ]
+    classified = _classify_edges(edges)
+    assert len(classified["circles"]) == 4
+
+    deduped = _dedupe_circles(classified["circles"])
+    assert len(deduped) == 2
+
+    radii = sorted([r for _, _, r in deduped])
+    assert abs(radii[0] - 0.005) < 1e-6
+    assert abs(radii[1] - 0.010) < 1e-6

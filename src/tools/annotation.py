@@ -346,6 +346,49 @@ def _find_bounding_edges(classified: dict) -> dict:
     return result
 
 
+_RADIUS_TOL = 1e-4  # 0.1mm — 同半徑去重容差
+
+
+def _dedupe_circles(
+    circles: list[tuple],
+) -> list[tuple]:
+    """同半徑只保留離幾何重心最遠的圓。
+
+    circles: [(edge, (cx,cy,cz), radius), ...]
+    回傳: [(edge, (cx,cy,cz), radius), ...]  去重後
+    """
+    if not circles:
+        return []
+
+    # 按 radius 分組（容差 _RADIUS_TOL）
+    groups: dict[float, list] = {}
+    for item in circles:
+        _, _center, r = item
+        matched = False
+        for key_r in groups:
+            if abs(r - key_r) < _RADIUS_TOL:
+                groups[key_r].append(item)
+                matched = True
+                break
+        if not matched:
+            groups[r] = [item]
+
+    # 幾何重心
+    all_cx = sum(c[0] for _, c, _ in circles) / len(circles)
+    all_cy = sum(c[1] for _, c, _ in circles) / len(circles)
+
+    # 每組取離重心最遠的
+    result = []
+    for _r, items in groups.items():
+        farthest = max(
+            items,
+            key=lambda it: (it[1][0] - all_cx) ** 2 + (it[1][1] - all_cy) ** 2,
+        )
+        result.append(farthest)
+
+    return result
+
+
 def _get_view_edges(view_obj) -> list:
     """從 IView 取得可見邊線列表。
 
@@ -888,6 +931,7 @@ def _auto_add_ref_dims_inner(
             return {"status": "error", "step": step, "error": "no views"}
 
         do_bbox = phase in ("bbox", "all")
+        do_circles = phase in ("circles", "all")
         total_dims = 0
         details = []
 
@@ -916,7 +960,8 @@ def _auto_add_ref_dims_inner(
                 "dims_added": [],
             }
 
-            if do_bbox:
+            # GetOutline 共用（bbox 和 circles 都需要）
+            if do_bbox or do_circles:
                 step = f"get_outline_{vi}"
                 try:
                     raw_outline = view_obj.GetOutline
@@ -928,6 +973,7 @@ def _auto_add_ref_dims_inner(
                 except Exception:
                     outline = [0, 0, 0.2, 0.2]
 
+            if do_bbox:
                 step = f"find_bounding_{vi}"
                 bounding = _find_bounding_edges(classified)
 
@@ -937,6 +983,20 @@ def _auto_add_ref_dims_inner(
                 )
                 view_detail["dims_added"].extend(bbox_dims)
                 total_dims += sum(1 for d in bbox_dims if d.get("ok"))
+
+            if do_circles:
+                step = f"dedupe_circles_{vi}"
+                deduped = _dedupe_circles(classified["circles"])
+                view_detail["circles_before_dedup"] = len(classified["circles"])
+                view_detail["circles_after_dedup"] = len(deduped)
+
+                if deduped:
+                    step = f"add_circle_dims_{vi}"
+                    circle_dims = _add_circle_dims(
+                        drawing, view_obj, deduped, outline, offset,
+                    )
+                    view_detail["dims_added"].extend(circle_dims)
+                    total_dims += sum(1 for d in circle_dims if d.get("ok"))
 
             details.append(view_detail)
 
@@ -1085,6 +1145,135 @@ def _add_bbox_dims(
         pass
 
     # 恢復尺寸值輸入對話框偏好
+    if orig_pref is not None:
+        try:
+            app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, orig_pref)
+        except Exception:
+            pass
+
+    return dims
+
+
+DIM_DIAMETER_OFFSET = 0.008  # 8mm — 直徑尺寸文字離視圖邊緣
+
+
+def _add_circle_dims(
+    drawing,
+    view_obj,
+    circles: list[tuple],
+    outline: list,
+    offset: float,
+) -> list:
+    """對去重後的圓 SelectEntity → AddDimension 建直徑尺寸。
+
+    circles: [(edge, (cx,cy,cz), radius), ...]（已去重）
+    outline: [xMin, yMin, xMax, yMax]（圖紙公尺）
+    offset: 基礎偏移量（公尺）
+    回傳: [{"type": "diameter", "value_mm": float, "ok": bool}, ...]
+    """
+    dims = []
+
+    try:
+        ext = drawing.Extension
+        if ext is None:
+            return [{"error": "drawing.Extension 回傳 None"}]
+    except Exception as e:
+        return [{"error": f"drawing.Extension 失敗: {e}"}]
+
+    # 關閉尺寸值輸入對話框
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    orig_pref = None
+    try:
+        orig_pref = app.GetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE)
+        app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, False)
+    except Exception as e:
+        dims.append({"warning": f"swInputDimValOnCreate: {e}"})
+
+    x_max = outline[2]
+    y_mid = (outline[1] + outline[3]) / 2
+
+    for i, (edge, (_cx, _cy, _cz), radius) in enumerate(circles):
+        diag = {
+            "type": "diameter",
+            "value_mm": round(radius * 2 * 1000, 3),
+        }
+
+        try:
+            drawing.ClearSelection2(True)
+        except Exception:
+            pass
+
+        # SelectEntity 選取圓形邊線
+        ok = False
+        try:
+            ok = view_obj.SelectEntity(edge, False)
+            diag["select_entity"] = ok
+        except Exception as e:
+            diag["select_entity"] = f"FAIL: {e}"
+
+        if not ok:
+            diag["ok"] = False
+            diag["error"] = "SelectEntity 失敗"
+            dims.append(diag)
+            continue
+
+        # 文字位置：視圖右側堆疊
+        stack_idx = i
+        dim_x = x_max + offset + stack_idx * DIM_OFFSET_STACK
+        dim_y = y_mid
+
+        # 嘗試 AddDimension（圓形選取應自動建直徑尺寸）
+        disp_dim = None
+        add_dim_errors = []
+
+        for d in range(4):
+            try:
+                disp_dim = ext.AddDimension(dim_x, dim_y, 0, d)
+                if disp_dim is not None:
+                    diag["method"] = f"ext.AddDimension(dir={d})"
+                    break
+            except Exception as e:
+                add_dim_errors.append(f"dir={d}: {e}")
+
+        if disp_dim is None:
+            try:
+                disp_dim = drawing.AddDimension2(dim_x, dim_y, 0)
+                if disp_dim is not None:
+                    diag["method"] = "AddDimension2"
+            except Exception as e:
+                add_dim_errors.append(f"AddDimension2: {e}")
+
+        if add_dim_errors:
+            diag["add_dim_errors"] = add_dim_errors
+
+        if disp_dim is not None:
+            try:
+                disp_dim.SetUnits2(
+                    False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+                )
+                disp_dim.SetPrecision3(
+                    2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+                )
+            except Exception as e:
+                diag["unit_warning"] = f"設定單位/精度失敗: {e}"
+            diag["ok"] = True
+            logger.info(
+                "circle 直徑尺寸已加: r=%.4f x=%.4f y=%.4f",
+                radius, dim_x, dim_y,
+            )
+        else:
+            diag["ok"] = False
+            diag["error"] = "AddDimension 回傳 None"
+
+        dims.append(diag)
+
+    try:
+        drawing.ClearSelection2(True)
+    except Exception:
+        pass
+
+    # 恢復偏好
     if orig_pref is not None:
         try:
             app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, orig_pref)
