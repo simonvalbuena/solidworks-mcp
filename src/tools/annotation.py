@@ -104,8 +104,8 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         先用 probe_drawing_edges 查詢邊線，再傳入邊線的 index + 座標。
         view_name: 目標視圖名稱。
         edge1: {"index": int, "x": float, "y": float} — 第一條邊線。
-        edge2: {"index": int, "x": float, "y": float} — 第二條邊線（linear 必填，diameter 不需要）。
-        dimension_type: "linear"（兩條邊線距離）或 "diameter"（圓形直徑）。
+        edge2: {"index": int, "x": float, "y": float} — 第二條邊線（linear 必填，diameter/radius 不需要）。
+        dimension_type: "linear"（兩條邊線距離）、"diameter"（圓形直徑）或 "radius"（圓弧半徑）。
         text_position: {"x": float, "y": float}（mm）— 尺寸文字位置，選填。"""
         try:
             if dimension_type == "linear":
@@ -115,10 +115,10 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
                     _add_linear_dimension,
                     view_name, edge1, edge2, text_position,
                 )
-            elif dimension_type == "diameter":
+            elif dimension_type in ("diameter", "radius"):
                 result = await sw.execute(
-                    _add_diameter_dimension,
-                    view_name, edge1, text_position,
+                    _add_radial_dimension,
+                    view_name, edge1, text_position, dimension_type,
                 )
             else:
                 raise ToolError(f"不支援的 dimension_type: {dimension_type}")
@@ -646,10 +646,10 @@ def _check_edge_type(
         )
 
 
-def _calc_diameter_text_pos(
+def _calc_radial_text_pos(
     edge_info: dict, outline_m: list,
 ) -> dict:
-    """計算直徑尺寸文字位置（mm）。
+    """計算徑向尺寸文字位置（mm）。
 
     x: 視圖右邊界 + 偏移
     y: 圓心 y
@@ -923,12 +923,13 @@ def _add_linear_dimension(
                 pass
 
 
-def _add_diameter_dimension(
+def _add_radial_dimension(
     view_name: str,
     edge1: dict,
     text_position: dict | None,
+    dim_kind: str,
 ) -> dict:
-    """COM 操作：在圓形邊線加直徑尺寸。"""
+    """COM 操作：在圓形/圓弧邊線加直徑或半徑尺寸。"""
     sw_conn = SWConnection.get_instance()
     app = sw_conn.get_app()
     drawing = app.ActiveDoc
@@ -954,7 +955,8 @@ def _add_diameter_dimension(
     edges_info = _build_edges_info(edges)
     idx, method = _resolve_edge(edges_info, edge1)
 
-    _check_edge_type(edges_info, idx, "circle", "diameter")
+    required = "circle" if dim_kind == "diameter" else "arc"
+    _check_edge_type(edges_info, idx, required, dim_kind)
 
     if text_position:
         text_x = text_position["x"] / _M_TO_MM
@@ -966,7 +968,7 @@ def _add_diameter_dimension(
                          raw_outline[2], raw_outline[3]]
         except Exception:
             outline_m = [0, 0, 0.2, 0.2]
-        auto_pos = _calc_diameter_text_pos(edges_info[idx], outline_m)
+        auto_pos = _calc_radial_text_pos(edges_info[idx], outline_m)
         text_x = auto_pos["x"] / _M_TO_MM
         text_y = auto_pos["y"] / _M_TO_MM
 
@@ -1002,7 +1004,8 @@ def _add_diameter_dimension(
                 pass
 
         if disp_dim is None:
-            raise SWError("AddDimension 回傳 None — 無法建立直徑尺寸")
+            label = "直徑" if dim_kind == "diameter" else "半徑"
+            raise SWError(f"AddDimension 回傳 None — 無法建立{label}尺寸")
 
         try:
             disp_dim.SetUnits2(
@@ -1025,7 +1028,7 @@ def _add_diameter_dimension(
 
         return {
             "status": "done",
-            "dimension_type": "diameter",
+            "dimension_type": dim_kind,
             "value_mm": value_mm,
             "text_position": {
                 "x": round(text_x * _M_TO_MM, 4),

@@ -566,10 +566,10 @@ def test_add_dim_diameter_rejects_non_circle():
 
 def test_add_dim_diameter_auto_text_position():
     """不傳 text_position 時自動計算：x 在視圖右側偏移，y 在圓心。"""
-    from tools.annotation import _calc_diameter_text_pos
+    from tools.annotation import _calc_radial_text_pos
     edge_info = {"index": 1, "type": "circle", "midpoint": {"x": 50.0, "y": 30.0}, "radius_mm": 5.0}
     outline_m = [0.0, 0.0, 0.1, 0.06]  # xMax=0.1m=100mm
-    pos = _calc_diameter_text_pos(edge_info, outline_m)
+    pos = _calc_radial_text_pos(edge_info, outline_m)
     assert "x" in pos
     assert "y" in pos
     assert pos["x"] > 100.0  # 右側偏移
@@ -578,7 +578,7 @@ def test_add_dim_diameter_auto_text_position():
 
 def test_add_dim_diameter_com_flow():
     """diameter COM 流程：SelectEntity 一次、AddDimension 正確、回傳 value_mm。"""
-    from tools.annotation import _add_diameter_dimension
+    from tools.annotation import _add_radial_dimension
     from unittest.mock import patch
 
     # 建立 circle edge mock
@@ -614,10 +614,11 @@ def test_add_dim_diameter_com_flow():
          patch("tools.annotation._get_drawing_views", return_value=[("工程視圖1", mock_view)]), \
          patch("tools.annotation._get_view_edges", return_value=[circle_edge]):
 
-        result = _add_diameter_dimension(
+        result = _add_radial_dimension(
             "工程視圖1",
             {"index": 0, "x": 50.0, "y": 30.0},
             None,
+            "diameter",
         )
 
     assert result["status"] == "done"
@@ -626,6 +627,82 @@ def test_add_dim_diameter_com_flow():
     assert result["match_method_edge1"] in ("index", "proximity")
     # SelectEntity 只呼叫一次，不帶 append
     mock_view.SelectEntity.assert_called_once_with(circle_edge, False)
+
+
+# --- radius tests ---
+
+def test_add_dim_radius_resolve_arc_edge():
+    """radius 正確 resolve arc edge。"""
+    from tools.annotation import _build_edges_info, _resolve_edge
+    edges = [
+        _make_mock_line_edge((0, 0, 0), (0.1, 0, 0)),
+        _make_mock_circle_edge_r((0.05, 0.03, 0), 0.005, full=False),
+    ]
+    edges_info = _build_edges_info(edges)
+    idx, method = _resolve_edge(edges_info, {"index": 1, "x": 50.0, "y": 30.0})
+    assert idx == 1
+    assert edges_info[idx]["type"] == "arc"
+
+
+def test_add_dim_radius_rejects_non_arc():
+    """edge type 不是 arc 時報 SWError。"""
+    from tools.annotation import _check_edge_type
+    from errors import SWError
+    edges_info = [{"index": 0, "type": "line", "midpoint": {"x": 50.0, "y": 0.0}}]
+    with pytest.raises(SWError, match="arc"):
+        _check_edge_type(edges_info, 0, "arc", "radius")
+
+
+def test_add_dim_radius_com_flow():
+    """radius COM 流程：SelectEntity 一次、AddDimension 正確、回傳 value_mm。"""
+    from tools.annotation import _add_radial_dimension
+    from unittest.mock import patch
+
+    # 建立 arc edge mock（full=False → arc）
+    arc_edge = _make_mock_circle_edge_r((0.05, 0.03, 0), 0.005, full=False)
+
+    # Mock view
+    mock_view = _make_mock_com()
+    type(mock_view).GetVisibleComponents = property(lambda self: ("comp1",))
+    mock_view.GetVisibleEntities2.return_value = [arc_edge]
+    mock_view.SelectEntity.return_value = True
+    type(mock_view).GetOutline = property(lambda self: [0.0, 0.0, 0.12, 0.08])
+
+    # Mock disp_dim + dimension value
+    mock_dim_value = MagicMock()
+    mock_dim_value.Value = 5.0  # 5mm radius (SetUnits2 後回傳 mm)
+    mock_disp_dim = MagicMock()
+    mock_disp_dim.GetDimension2.return_value = mock_dim_value
+
+    mock_ext = MagicMock()
+    mock_ext.AddDimension.return_value = mock_disp_dim
+
+    mock_drawing = _make_mock_com()
+    mock_drawing.Extension = mock_ext
+    type(mock_drawing).GetType = property(lambda self: 3)
+
+    mock_app = MagicMock()
+    mock_app.ActiveDoc = mock_drawing
+
+    mock_sw = MagicMock()
+    mock_sw.get_app.return_value = mock_app
+
+    with patch("tools.annotation.SWConnection.get_instance", return_value=mock_sw), \
+         patch("tools.annotation._get_drawing_views", return_value=[("工程視圖1", mock_view)]), \
+         patch("tools.annotation._get_view_edges", return_value=[arc_edge]):
+
+        result = _add_radial_dimension(
+            "工程視圖1",
+            {"index": 0, "x": 50.0, "y": 30.0},
+            None,
+            "radius",
+        )
+
+    assert result["status"] == "done"
+    assert result["dimension_type"] == "radius"
+    assert result["value_mm"] == 5.0
+    assert result["match_method_edge1"] in ("index", "proximity")
+    mock_view.SelectEntity.assert_called_once_with(arc_edge, False)
 
 
 # --- linear return structure tests ---
