@@ -760,3 +760,87 @@ def test_add_dim_linear_returns_value_mm():
     assert result["status"] == "done"
     assert result["dimension_type"] == "linear"
     assert result["value_mm"] == 50.0
+
+
+# --- angle dimension tests ---
+
+
+def test_add_dim_angle_resolve_line_edges():
+    """angle 正確 resolve 兩條 line edge。"""
+    from tools.annotation import _build_edges_info, _resolve_edge, _check_edge_type
+    edges = [
+        _make_mock_line_edge((0, 0, 0), (0.1, 0, 0)),        # horizontal
+        _make_mock_line_edge((0, 0, 0), (0, 0.05, 0)),       # vertical
+        _make_mock_circle_edge_r((0.05, 0.03, 0), 0.005),    # circle
+    ]
+    edges_info = _build_edges_info(edges)
+    idx1, _ = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 0.0})
+    idx2, _ = _resolve_edge(edges_info, {"index": 1, "x": 0.0, "y": 25.0})
+    assert edges_info[idx1]["type"] == "line"
+    assert edges_info[idx2]["type"] == "line"
+    # type check 應該通過（不拋例外）
+    _check_edge_type(edges_info, idx1, "line", "angle")
+    _check_edge_type(edges_info, idx2, "line", "angle")
+
+
+def test_add_dim_angle_rejects_non_line():
+    """edge type 不是 line 時報 SWError。"""
+    from tools.annotation import _check_edge_type
+    from errors import SWError
+    edges_info = [{"index": 0, "type": "circle", "midpoint": {"x": 50.0, "y": 30.0}}]
+    with pytest.raises(SWError, match="line"):
+        _check_edge_type(edges_info, 0, "line", "angle")
+
+
+def test_add_dim_angle_com_flow():
+    """angle COM 流程：SelectEntity 兩次、回傳 dimension_type='angle' + value_deg。"""
+    from tools.annotation import _add_angle_dimension
+    from unittest.mock import patch, call
+
+    edge_h = _make_mock_line_edge((0, 0, 0), (0.1, 0, 0))       # horizontal
+    edge_v = _make_mock_line_edge((0, 0, 0), (0, 0.05, 0))      # vertical
+
+    mock_view = _make_mock_com()
+    type(mock_view).GetVisibleComponents = property(lambda self: ("comp1",))
+    mock_view.GetVisibleEntities2.return_value = [edge_h, edge_v]
+    mock_view.SelectEntity.return_value = True
+
+    mock_dim_value = MagicMock()
+    mock_dim_value.Value = 90.0  # 90 degrees
+    mock_disp_dim = MagicMock()
+    mock_disp_dim.GetDimension2.return_value = mock_dim_value
+
+    mock_ext = MagicMock()
+    mock_ext.AddDimension.return_value = mock_disp_dim
+
+    mock_drawing = _make_mock_com()
+    mock_drawing.Extension = mock_ext
+    type(mock_drawing).GetType = property(lambda self: 3)
+
+    mock_app = MagicMock()
+    mock_app.ActiveDoc = mock_drawing
+
+    mock_sw = MagicMock()
+    mock_sw.get_app.return_value = mock_app
+
+    with patch("tools.annotation.SWConnection.get_instance", return_value=mock_sw), \
+         patch("tools.annotation._get_drawing_views", return_value=[("工程視圖1", mock_view)]), \
+         patch("tools.annotation._get_view_edges", return_value=[edge_h, edge_v]):
+
+        result = _add_angle_dimension(
+            "工程視圖1",
+            {"index": 0, "x": 50.0, "y": 0.0},
+            {"index": 1, "x": 0.0, "y": 25.0},
+            None,
+        )
+
+    assert result["status"] == "done"
+    assert result["dimension_type"] == "angle"
+    assert result["value_deg"] == 90.0
+    assert "value_mm" not in result
+    assert result["match_method_edge1"] in ("index", "proximity")
+    assert result["match_method_edge2"] in ("index", "proximity")
+    # SelectEntity: 第一次 append=False，第二次 append=True
+    assert mock_view.SelectEntity.call_count == 2
+    mock_view.SelectEntity.assert_any_call(edge_h, False)
+    mock_view.SelectEntity.assert_any_call(edge_v, True)
