@@ -144,6 +144,33 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         except Exception as e:
             raise ToolError(f"insert_section_view 未預期錯誤: {e}")
 
+    @mcp.tool()
+    async def insert_detail_view(
+        parent_view: str,
+        center: dict,
+        radius: float,
+        label: str = "A",
+        scale: float = 2.0,
+        position: dict | None = None,
+    ) -> str:
+        """在工程圖中建立局部放大圖。
+        parent_view: 父視圖名稱（在哪個視圖上圈放大區域）。
+        center: 放大區域中心點 {"x": mm, "y": mm}，sheet 絕對座標。
+        radius: 放大區域半徑（mm）。
+        label: 局部圖標記（A, B, C...），預設 "A"。
+        scale: 放大比例分子（如 2 表示 2:1），預設 2。
+        position: 局部放大圖在 sheet 上的位置 {"x": mm, "y": mm}，預設父視圖右上方。"""
+        try:
+            result = await sw.execute(
+                _insert_detail_view,
+                parent_view, center, radius, label, scale, position,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except SWError as e:
+            raise ToolError(f"insert_detail_view 失敗: {e}")
+        except Exception as e:
+            raise ToolError(f"insert_detail_view 未預期錯誤: {e}")
+
 
 def _create_drawing(template_path: str, paper_size: str) -> dict:
     sw_conn = SWConnection.get_instance()
@@ -374,5 +401,105 @@ def _insert_section_view(
             "y": round(sv_pos[1] * 1000, 1),
         },
         "scale": f"{sv_scale[0]:g}:{sv_scale[1]:g}",
+        "parent_view": parent_view,
+    }
+
+
+# Detail view constants
+_SW_DET_VIEW_STANDARD = 0
+_SW_DET_CIRCLE_CIRCLE = 1
+
+
+def _insert_detail_view(
+    parent_view: str,
+    center: dict,
+    radius: float,
+    label: str = "A",
+    scale: float = 2.0,
+    position: dict | None = None,
+) -> dict:
+    """在父視圖上畫放大圓，建立局部放大圖。"""
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    drawing = app.ActiveDoc
+
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    if scale <= 0:
+        raise SWError("放大比例必須大於 0")
+
+    if radius <= 0:
+        raise SWError("放大區域半徑必須大於 0")
+
+    # 找父視圖
+    from tools.annotation import _get_drawing_views
+
+    views = _get_drawing_views(drawing, parent_view)
+    if not views:
+        raise SWError(f"找不到視圖: {parent_view}")
+
+    _, view_obj = views[0]
+
+    # 取得父視圖 outline（meters）
+    outline = view_obj.GetOutline  # [xmin, ymin, xmax, ymax]
+
+    # 計算局部放大圖位置
+    if position is not None:
+        pos_x = position["x"] * _MM_TO_M
+        pos_y = position["y"] * _MM_TO_M
+    else:
+        pos_x = outline[2] + 0.05  # 右邊 + 50mm
+        pos_y = outline[3]          # 上緣齊平
+
+    # 放大圓座標 mm → meters
+    cx = center["x"] * _MM_TO_M
+    cy = center["y"] * _MM_TO_M
+    r = radius * _MM_TO_M
+
+    # COM 流程
+    if not drawing.ActivateView(parent_view):
+        raise SWError(f"無法啟動視圖: {parent_view}")
+    drawing.ClearSelection2(True)
+
+    sketch_mgr = drawing.SketchManager
+    circle = sketch_mgr.CreateCircle(cx, cy, 0, cx + r, cy, 0)
+    if circle is None:
+        raise SWError("無法繪製放大區域圓")
+
+    detail_view = drawing.CreateDetailViewAt4(
+        pos_x, pos_y, 0,
+        _SW_DET_VIEW_STANDARD,     # style
+        scale, 1.0,                 # scale1, scale2
+        label,
+        _SW_DET_CIRCLE_CIRCLE,     # showtype
+        True,                       # fullOutline
+        False,                      # jaggedOutline
+        False,                      # noOutline
+        5,                          # shapeIntensity
+    )
+    if detail_view is None:
+        raise SWError("無法建立局部放大圖")
+
+    # Rebuild
+    try:
+        drawing.EditRebuild3()
+    except Exception:
+        pass
+
+    # 讀取結果
+    dv_name = detail_view.Name
+    dv_pos = detail_view.Position
+    dv_scale = detail_view.ScaleRatio
+
+    return {
+        "status": "done",
+        "view_name": dv_name,
+        "label": label,
+        "position": {
+            "x": round(dv_pos[0] * 1000, 1),
+            "y": round(dv_pos[1] * 1000, 1),
+        },
+        "scale": f"{dv_scale[0]:g}:{dv_scale[1]:g}",
         "parent_view": parent_view,
     }

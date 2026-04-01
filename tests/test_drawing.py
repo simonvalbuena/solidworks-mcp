@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 try:
-    from tools.drawing import _insert_section_view
+    from tools.drawing import _insert_section_view, _insert_detail_view
     HAS_DEPS = True
 except ImportError:
     HAS_DEPS = False
@@ -192,4 +192,146 @@ def test_insert_section_view_parent_not_found():
                     "start": {"x": 100, "y": 200},
                     "end": {"x": 100, "y": 100},
                 },
+            )
+
+
+# === insert_detail_view tests ===
+
+
+# --- Test 4: detail view 完整 COM 流程 ---
+
+def test_insert_detail_view_com_flow():
+    """mock 完整 COM 流程：ActivateView → CreateCircle → CreateDetailViewAt4。"""
+    from tools.drawing import _insert_detail_view
+
+    outline_m = [0.4364, 0.4332, 0.5148, 0.4919]  # meters
+    drawing, views = _make_mock_drawing_with_views([
+        ("工程視圖1", outline_m),
+    ])
+
+    # Mock detail view result
+    detail_view = _make_mock_com()
+    detail_view.Name = "局部視圖 A (2 : 1)"
+    detail_view.Position = (0.5648, 0.4919)
+    detail_view.ScaleRatio = (2.0, 1.0)
+    drawing.CreateDetailViewAt4.return_value = detail_view
+
+    # Mock SketchManager
+    sketch_mgr = _make_mock_com()
+    circle = _make_mock_com()
+    sketch_mgr.CreateCircle.return_value = circle
+    type(drawing).SketchManager = property(lambda self: sketch_mgr)
+
+    with patch("tools.drawing.SWConnection") as MockSW:
+        inst = MockSW.get_instance.return_value
+        inst.get_app.return_value = _make_mock_com()
+        inst.get_app.return_value.ActiveDoc = drawing
+
+        result = _insert_detail_view(
+            parent_view="工程視圖1",
+            center={"x": 475.6, "y": 462.6},
+            radius=15.0,
+            label="A",
+            scale=2.0,
+            position={"x": 564.8, "y": 491.9},
+        )
+
+    assert result["status"] == "done"
+    assert result["view_name"] == "局部視圖 A (2 : 1)"
+    assert result["label"] == "A"
+    assert result["parent_view"] == "工程視圖1"
+    assert "position" in result
+    assert "scale" in result
+
+    # 驗證 COM 呼叫順序
+    drawing.ActivateView.assert_called_once_with("工程視圖1")
+    drawing.ClearSelection2.assert_called_once_with(True)
+    sketch_mgr.CreateCircle.assert_called_once()
+    drawing.CreateDetailViewAt4.assert_called_once()
+
+    # 驗證 CreateCircle 座標（mm → meters）
+    cc_args = sketch_mgr.CreateCircle.call_args[0]
+    assert abs(cc_args[0] - 0.4756) < 0.001   # center_x
+    assert abs(cc_args[1] - 0.4626) < 0.001   # center_y
+    assert cc_args[2] == 0                      # center_z
+    assert abs(cc_args[3] - 0.4906) < 0.001   # edge_x = center_x + radius
+    assert abs(cc_args[4] - 0.4626) < 0.001   # edge_y = center_y
+    assert cc_args[5] == 0                      # edge_z
+
+    # 驗證 CreateDetailViewAt4 參數
+    cdv_args = drawing.CreateDetailViewAt4.call_args[0]
+    assert abs(cdv_args[0] - 0.5648) < 0.001  # pos_x
+    assert abs(cdv_args[1] - 0.4919) < 0.001  # pos_y
+    assert cdv_args[2] == 0                     # z
+    assert cdv_args[3] == 0                     # style = swDetViewSTANDARD
+    assert cdv_args[4] == 2.0                   # scale1
+    assert cdv_args[5] == 1.0                   # scale2
+    assert cdv_args[6] == "A"                   # label
+    assert cdv_args[7] == 1                     # showtype = swDetCircleCIRCLE
+
+
+# --- Test 5: detail view auto position ---
+
+def test_insert_detail_view_auto_position():
+    """不提供 position，驗證自動計算（父視圖右上方）。"""
+    from tools.drawing import _insert_detail_view
+
+    outline_m = [0.4364, 0.4332, 0.5148, 0.4919]
+    drawing, views = _make_mock_drawing_with_views([
+        ("工程視圖1", outline_m),
+    ])
+
+    detail_view = _make_mock_com()
+    detail_view.Name = "局部視圖 A (2 : 1)"
+    detail_view.Position = (0.5648, 0.4919)
+    detail_view.ScaleRatio = (2.0, 1.0)
+    drawing.CreateDetailViewAt4.return_value = detail_view
+
+    sketch_mgr = _make_mock_com()
+    sketch_mgr.CreateCircle.return_value = _make_mock_com()
+    type(drawing).SketchManager = property(lambda self: sketch_mgr)
+
+    with patch("tools.drawing.SWConnection") as MockSW:
+        inst = MockSW.get_instance.return_value
+        inst.get_app.return_value = _make_mock_com()
+        inst.get_app.return_value.ActiveDoc = drawing
+
+        result = _insert_detail_view(
+            parent_view="工程視圖1",
+            center={"x": 475.6, "y": 462.6},
+            radius=15.0,
+            label="A",
+            scale=2.0,
+            position=None,  # auto
+        )
+
+    # 驗證 CreateDetailViewAt4 的 position 參數
+    cdv_args = drawing.CreateDetailViewAt4.call_args[0]
+    expected_x = outline_m[2] + 0.05   # 右邊 + 50mm
+    expected_y = outline_m[3]          # 上緣齊平
+    assert abs(cdv_args[0] - expected_x) < 0.001
+    assert abs(cdv_args[1] - expected_y) < 0.001
+
+
+# --- Test 6: detail view parent not found ---
+
+def test_insert_detail_view_parent_not_found():
+    """父視圖名稱不存在時 raise SWError。"""
+    from tools.drawing import _insert_detail_view
+    from errors import SWError
+
+    drawing, _ = _make_mock_drawing_with_views([
+        ("工程視圖1", [0.4, 0.4, 0.5, 0.5]),
+    ])
+
+    with patch("tools.drawing.SWConnection") as MockSW:
+        inst = MockSW.get_instance.return_value
+        inst.get_app.return_value = _make_mock_com()
+        inst.get_app.return_value.ActiveDoc = drawing
+
+        with pytest.raises(SWError, match="找不到"):
+            _insert_detail_view(
+                parent_view="不存在的視圖",
+                center={"x": 100, "y": 200},
+                radius=10.0,
             )
