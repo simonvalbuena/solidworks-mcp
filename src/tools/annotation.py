@@ -96,23 +96,37 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
     async def add_dimension(
         view_name: str,
         edge1: dict,
-        edge2: dict,
+        edge2: dict | None = None,
+        dimension_type: str = "linear",
         text_position: dict | None = None,
     ) -> str:
-        """在兩條邊線之間加線性尺寸。
+        """在視圖上新增尺寸標註。
         先用 probe_drawing_edges 查詢邊線，再傳入邊線的 index + 座標。
         view_name: 目標視圖名稱。
         edge1: {"index": int, "x": float, "y": float} — 第一條邊線。
-        edge2: {"index": int, "x": float, "y": float} — 第二條邊線。
+        edge2: {"index": int, "x": float, "y": float} — 第二條邊線（linear 必填，diameter 不需要）。
+        dimension_type: "linear"（兩條邊線距離）或 "diameter"（圓形直徑）。
         text_position: {"x": float, "y": float}（mm）— 尺寸文字位置，選填。"""
         try:
-            result = await sw.execute(
-                _add_linear_dimension,
-                view_name, edge1, edge2, text_position,
-            )
+            if dimension_type == "linear":
+                if edge2 is None:
+                    raise ToolError("linear 尺寸需要 edge2")
+                result = await sw.execute(
+                    _add_linear_dimension,
+                    view_name, edge1, edge2, text_position,
+                )
+            elif dimension_type == "diameter":
+                result = await sw.execute(
+                    _add_diameter_dimension,
+                    view_name, edge1, text_position,
+                )
+            else:
+                raise ToolError(f"不支援的 dimension_type: {dimension_type}")
             return json.dumps(result, ensure_ascii=False)
         except SWError as e:
             raise ToolError(f"add_dimension 失敗: {e}")
+        except ToolError:
+            raise
         except Exception as e:
             raise ToolError(f"add_dimension 未預期錯誤: {e}")
 
@@ -620,6 +634,33 @@ def _calc_text_position(
     }
 
 
+def _check_edge_type(
+    edges_info: list[dict], idx: int, required_type: str, dim_type_label: str,
+) -> None:
+    """驗證邊線類型。不符合時拋 SWError。"""
+    actual = edges_info[idx]["type"]
+    if actual != required_type:
+        raise SWError(
+            f"{dim_type_label} 尺寸需要 {required_type} 邊線，"
+            f"但 edge {idx} 是 {actual}"
+        )
+
+
+def _calc_diameter_text_pos(
+    edge_info: dict, outline_m: list,
+) -> dict:
+    """計算直徑尺寸文字位置（mm）。
+
+    x: 視圖右邊界 + 偏移
+    y: 圓心 y
+    edge_info: from _build_edge_info（mm）
+    outline_m: [xMin, yMin, xMax, yMax]（meters，from view.GetOutline）
+    """
+    x_right = outline_m[2] * _M_TO_MM + _DIM_TEXT_OFFSET_MM
+    y_center = edge_info["midpoint"]["y"]
+    return {"x": round(x_right, 4), "y": round(y_center, 4)}
+
+
 def _insert_model_dimensions(
     view_name: str | None,
     dimension_type: str,
@@ -851,16 +892,146 @@ def _add_linear_dimension(
         except Exception:
             pass
 
+        value_mm = None
+        try:
+            dim = disp_dim.GetDimension2(0)
+            value_mm = round(dim.Value, 4)
+        except Exception:
+            pass
+
         drawing.ClearSelection2(True)
 
         return {
             "status": "done",
+            "dimension_type": "linear",
+            "value_mm": value_mm,
             "text_position": {
                 "x": round(text_x * _M_TO_MM, 4),
                 "y": round(text_y * _M_TO_MM, 4),
             },
             "match_method_edge1": method1,
             "match_method_edge2": method2,
+        }
+
+    finally:
+        if orig_pref is not None:
+            try:
+                app.SetUserPreferenceToggle(
+                    SW_INPUT_DIM_VAL_ON_CREATE, orig_pref,
+                )
+            except Exception:
+                pass
+
+
+def _add_diameter_dimension(
+    view_name: str,
+    edge1: dict,
+    text_position: dict | None,
+) -> dict:
+    """COM 操作：在圓形邊線加直徑尺寸。"""
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    drawing = app.ActiveDoc
+
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    doc_type = _safe_get(drawing, "GetType")
+    if doc_type is not None and doc_type != 3:
+        raise SWError(f"目前的文件不是 Drawing（type={doc_type}）")
+
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"找不到視圖: {view_name}")
+
+    vname, view_obj = views[0]
+    drawing.ActivateView(vname)
+
+    edges = _get_view_edges(view_obj)
+    if not edges:
+        raise SWError(f"視圖 {vname} 沒有可見邊線")
+
+    edges_info = _build_edges_info(edges)
+    idx, method = _resolve_edge(edges_info, edge1)
+
+    _check_edge_type(edges_info, idx, "circle", "diameter")
+
+    if text_position:
+        text_x = text_position["x"] / _M_TO_MM
+        text_y = text_position["y"] / _M_TO_MM
+    else:
+        try:
+            raw_outline = view_obj.GetOutline
+            outline_m = [raw_outline[0], raw_outline[1],
+                         raw_outline[2], raw_outline[3]]
+        except Exception:
+            outline_m = [0, 0, 0.2, 0.2]
+        auto_pos = _calc_diameter_text_pos(edges_info[idx], outline_m)
+        text_x = auto_pos["x"] / _M_TO_MM
+        text_y = auto_pos["y"] / _M_TO_MM
+
+    orig_pref = None
+    try:
+        orig_pref = app.GetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE)
+        app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, False)
+    except Exception:
+        pass
+
+    try:
+        drawing.ClearSelection2(True)
+        ok = view_obj.SelectEntity(edges[idx], False)
+
+        if not ok:
+            raise SWError(f"SelectEntity 失敗: edge {idx}")
+
+        ext = drawing.Extension
+        disp_dim = None
+
+        for d in range(4):
+            try:
+                disp_dim = ext.AddDimension(text_x, text_y, 0, d)
+                if disp_dim is not None:
+                    break
+            except Exception:
+                pass
+
+        if disp_dim is None:
+            try:
+                disp_dim = drawing.AddDimension2(text_x, text_y, 0)
+            except Exception:
+                pass
+
+        if disp_dim is None:
+            raise SWError("AddDimension 回傳 None — 無法建立直徑尺寸")
+
+        try:
+            disp_dim.SetUnits2(
+                False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+            )
+            disp_dim.SetPrecision3(
+                2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+            )
+        except Exception:
+            pass
+
+        value_mm = None
+        try:
+            dim = disp_dim.GetDimension2(0)
+            value_mm = round(dim.Value, 4)
+        except Exception:
+            pass
+
+        drawing.ClearSelection2(True)
+
+        return {
+            "status": "done",
+            "dimension_type": "diameter",
+            "value_mm": value_mm,
+            "text_position": {
+                "x": round(text_x * _M_TO_MM, 4),
+                "y": round(text_y * _M_TO_MM, 4),
+            },
+            "match_method_edge1": method,
         }
 
     finally:

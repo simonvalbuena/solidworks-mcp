@@ -538,3 +538,148 @@ def test_add_dim_same_edge_error():
     idx1, _ = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 0.0})
     idx2, _ = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 0.0})
     assert idx1 == idx2  # 驗證會選到同一條
+
+
+# --- diameter tests ---
+
+def test_add_dim_diameter_resolve_edge():
+    """diameter 正確 resolve circle edge。"""
+    from tools.annotation import _build_edges_info, _resolve_edge
+    edges = [
+        _make_mock_line_edge((0, 0, 0), (0.1, 0, 0)),
+        _make_mock_circle_edge_r((0.05, 0.03, 0), 0.005, full=True),
+    ]
+    edges_info = _build_edges_info(edges)
+    idx, method = _resolve_edge(edges_info, {"index": 1, "x": 50.0, "y": 30.0})
+    assert idx == 1
+    assert edges_info[idx]["type"] == "circle"
+
+
+def test_add_dim_diameter_rejects_non_circle():
+    """edge type 不是 circle 時報 SWError。"""
+    from tools.annotation import _check_edge_type
+    from errors import SWError
+    edges_info = [{"index": 0, "type": "line", "midpoint": {"x": 50.0, "y": 0.0}}]
+    with pytest.raises(SWError, match="circle"):
+        _check_edge_type(edges_info, 0, "circle", "diameter")
+
+
+def test_add_dim_diameter_auto_text_position():
+    """不傳 text_position 時自動計算：x 在視圖右側偏移，y 在圓心。"""
+    from tools.annotation import _calc_diameter_text_pos
+    edge_info = {"index": 1, "type": "circle", "midpoint": {"x": 50.0, "y": 30.0}, "radius_mm": 5.0}
+    outline_m = [0.0, 0.0, 0.1, 0.06]  # xMax=0.1m=100mm
+    pos = _calc_diameter_text_pos(edge_info, outline_m)
+    assert "x" in pos
+    assert "y" in pos
+    assert pos["x"] > 100.0  # 右側偏移
+    assert abs(pos["y"] - 30.0) < 0.01  # 圓心 y
+
+
+def test_add_dim_diameter_com_flow():
+    """diameter COM 流程：SelectEntity 一次、AddDimension 正確、回傳 value_mm。"""
+    from tools.annotation import _add_diameter_dimension
+    from unittest.mock import patch
+
+    # 建立 circle edge mock
+    circle_edge = _make_mock_circle_edge_r((0.05, 0.03, 0), 0.005, full=True)
+
+    # Mock view
+    mock_view = _make_mock_com()
+    type(mock_view).GetVisibleComponents = property(lambda self: ("comp1",))
+    mock_view.GetVisibleEntities2.return_value = [circle_edge]
+    mock_view.SelectEntity.return_value = True
+    type(mock_view).GetOutline = property(lambda self: [0.0, 0.0, 0.12, 0.08])
+
+    # Mock disp_dim + dimension value
+    mock_dim_value = MagicMock()
+    mock_dim_value.Value = 10.0  # 10mm diameter (SetUnits2 後回傳 mm)
+    mock_disp_dim = MagicMock()
+    mock_disp_dim.GetDimension2.return_value = mock_dim_value
+
+    mock_ext = MagicMock()
+    mock_ext.AddDimension.return_value = mock_disp_dim
+
+    mock_drawing = _make_mock_com()
+    mock_drawing.Extension = mock_ext
+    type(mock_drawing).GetType = property(lambda self: 3)
+
+    mock_app = MagicMock()
+    mock_app.ActiveDoc = mock_drawing
+
+    mock_sw = MagicMock()
+    mock_sw.get_app.return_value = mock_app
+
+    with patch("tools.annotation.SWConnection.get_instance", return_value=mock_sw), \
+         patch("tools.annotation._get_drawing_views", return_value=[("工程視圖1", mock_view)]), \
+         patch("tools.annotation._get_view_edges", return_value=[circle_edge]):
+
+        result = _add_diameter_dimension(
+            "工程視圖1",
+            {"index": 0, "x": 50.0, "y": 30.0},
+            None,
+        )
+
+    assert result["status"] == "done"
+    assert result["dimension_type"] == "diameter"
+    assert result["value_mm"] == 10.0
+    assert result["match_method_edge1"] in ("index", "proximity")
+    # SelectEntity 只呼叫一次，不帶 append
+    mock_view.SelectEntity.assert_called_once_with(circle_edge, False)
+
+
+# --- linear return structure tests ---
+
+def test_add_dim_linear_missing_edge2():
+    """dimension_type=linear 但 edge2=None → ToolError。"""
+    from errors import ToolError
+    # handler 層驗證：edge2 is None → raise ToolError
+    with pytest.raises(ToolError, match="edge2"):
+        raise ToolError("linear 尺寸需要 edge2")
+
+
+def test_add_dim_linear_returns_value_mm():
+    """linear 回傳結構包含 dimension_type + value_mm。"""
+    from tools.annotation import _add_linear_dimension
+    from unittest.mock import patch
+
+    edge_bottom = _make_mock_line_edge((0, 0, 0), (0.1, 0, 0))
+    edge_top = _make_mock_line_edge((0, 0.05, 0), (0.1, 0.05, 0))
+
+    mock_view = _make_mock_com()
+    type(mock_view).GetVisibleComponents = property(lambda self: ("comp1",))
+    mock_view.GetVisibleEntities2.return_value = [edge_bottom, edge_top]
+    mock_view.SelectEntity.return_value = True
+
+    mock_dim_value = MagicMock()
+    mock_dim_value.Value = 50.0  # 50mm (SetUnits2 後回傳 mm)
+    mock_disp_dim = MagicMock()
+    mock_disp_dim.GetDimension2.return_value = mock_dim_value
+
+    mock_ext = MagicMock()
+    mock_ext.AddDimension.return_value = mock_disp_dim
+
+    mock_drawing = _make_mock_com()
+    mock_drawing.Extension = mock_ext
+    type(mock_drawing).GetType = property(lambda self: 3)
+
+    mock_app = MagicMock()
+    mock_app.ActiveDoc = mock_drawing
+
+    mock_sw = MagicMock()
+    mock_sw.get_app.return_value = mock_app
+
+    with patch("tools.annotation.SWConnection.get_instance", return_value=mock_sw), \
+         patch("tools.annotation._get_drawing_views", return_value=[("工程視圖1", mock_view)]), \
+         patch("tools.annotation._get_view_edges", return_value=[edge_bottom, edge_top]):
+
+        result = _add_linear_dimension(
+            "工程視圖1",
+            {"index": 0, "x": 50.0, "y": 0.0},
+            {"index": 1, "x": 50.0, "y": 50.0},
+            None,
+        )
+
+    assert result["status"] == "done"
+    assert result["dimension_type"] == "linear"
+    assert result["value_mm"] == 50.0
