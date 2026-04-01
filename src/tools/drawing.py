@@ -119,6 +119,31 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         except SWError as e:
             raise ToolError(f"insert_standard_views_aligned 失敗: {e}")
 
+    @mcp.tool()
+    async def insert_section_view(
+        parent_view: str,
+        section_line: dict,
+        label: str = "A",
+        position: dict | None = None,
+        scale: float | None = None,
+    ) -> str:
+        """在工程圖中建立剖面圖。
+        parent_view: 父視圖名稱（在哪個視圖上切剖面）。
+        section_line: 剖面線定義 {"start": {"x": mm, "y": mm}, "end": {"x": mm, "y": mm}}，sheet 絕對座標。
+        label: 剖面標記（A, B, C...），預設 "A"。
+        position: 剖面圖在 sheet 上的位置 {"x": mm, "y": mm}，預設父視圖右側 +50mm。
+        scale: 比例分母（如 5 表示 1:5），預設繼承父視圖。"""
+        try:
+            result = await sw.execute(
+                _insert_section_view,
+                parent_view, section_line, label, position, scale,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except SWError as e:
+            raise ToolError(f"insert_section_view 失敗: {e}")
+        except Exception as e:
+            raise ToolError(f"insert_section_view 未預期錯誤: {e}")
+
 
 def _create_drawing(template_path: str, paper_size: str) -> dict:
     sw_conn = SWConnection.get_instance()
@@ -253,4 +278,101 @@ def _insert_1st_angle_views(source_doc: str) -> dict:
     return {
         "model": model_name,
         "status": "inserted",
+    }
+
+
+_MM_TO_M = 0.001
+
+
+def _insert_section_view(
+    parent_view: str,
+    section_line: dict,
+    label: str = "A",
+    position: dict | None = None,
+    scale: float | None = None,
+) -> dict:
+    """在父視圖上畫剖面線，建立剖面圖。"""
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    drawing = app.ActiveDoc
+
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    # 找父視圖
+    from tools.annotation import _get_drawing_views
+
+    views = _get_drawing_views(drawing, parent_view)
+    if not views:
+        raise SWError(f"找不到視圖: {parent_view}")
+
+    _, view_obj = views[0]
+
+    # 取得父視圖 outline（meters）
+    outline = view_obj.GetOutline  # [xmin, ymin, xmax, ymax]
+
+    # 計算剖面圖位置
+    if position is not None:
+        pos_x = position["x"] * _MM_TO_M
+        pos_y = position["y"] * _MM_TO_M
+    else:
+        pos_x = outline[2] + 0.05  # 右邊 + 50mm
+        pos_y = (outline[1] + outline[3]) / 2  # 垂直居中
+
+    # 剖面線座標 mm -> meters
+    start_x = section_line["start"]["x"] * _MM_TO_M
+    start_y = section_line["start"]["y"] * _MM_TO_M
+    end_x = section_line["end"]["x"] * _MM_TO_M
+    end_y = section_line["end"]["y"] * _MM_TO_M
+
+    # COM 流程
+    if not drawing.ActivateView(parent_view):
+        raise SWError(f"無法啟動視圖: {parent_view}")
+    drawing.ClearSelection2(True)
+
+    sketch_mgr = drawing.SketchManager
+    seg = sketch_mgr.CreateLine(start_x, start_y, 0, end_x, end_y, 0)
+    if seg is None:
+        raise SWError("無法繪製剖面線")
+
+    section_view = drawing.CreateSectionViewAt5(
+        pos_x, pos_y, 0,
+        label,
+        0,      # options
+        None,   # excludedComponents
+        0,      # sectionDepth
+    )
+    if section_view is None:
+        raise SWError("無法建立剖面圖")
+
+    # 設定比例
+    if scale is not None:
+        if scale <= 0:
+            raise SWError("比例分母必須大於 0")
+        try:
+            section_view.ScaleRatio = (1.0, scale)
+        except Exception:
+            pass
+
+    # Rebuild
+    try:
+        drawing.EditRebuild3()
+    except Exception:
+        pass
+
+    # 讀取結果
+    sv_name = section_view.Name
+    sv_pos = section_view.Position
+    sv_scale = section_view.ScaleRatio
+
+    return {
+        "status": "done",
+        "view_name": sv_name,
+        "label": label,
+        "position": {
+            "x": round(sv_pos[0] * 1000, 1),
+            "y": round(sv_pos[1] * 1000, 1),
+        },
+        "scale": f"{sv_scale[0]:g}:{sv_scale[1]:g}",
+        "parent_view": parent_view,
     }
