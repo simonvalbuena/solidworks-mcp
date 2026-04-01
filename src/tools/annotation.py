@@ -80,8 +80,10 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
     async def probe_drawing_edges(
         view_name: str | None = None,
     ) -> str:
-        """診斷工具：測試 GetVisibleEntities2 和 IEdge 方法是否可用。
-        view_name: 指定視圖名稱，預設第一個視圖。"""
+        """查詢 Drawing 視圖的可見邊線資訊。
+        回傳每條邊線的 index、type、座標（mm）、幾何參數。
+        用於 add_dimension 前確認邊線位置。
+        view_name: 指定視圖名稱，預設全部視圖。"""
         try:
             result = await sw.execute(_probe_drawing_edges, view_name)
             return json.dumps(result, ensure_ascii=False)
@@ -89,6 +91,30 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
             raise ToolError(f"probe_drawing_edges 失敗: {e}")
         except Exception as e:
             raise ToolError(f"probe_drawing_edges 未預期錯誤: {e}")
+
+    @mcp.tool()
+    async def add_dimension(
+        view_name: str,
+        edge1: dict,
+        edge2: dict,
+        text_position: dict | None = None,
+    ) -> str:
+        """在兩條邊線之間加線性尺寸。
+        先用 probe_drawing_edges 查詢邊線，再傳入邊線的 index + 座標。
+        view_name: 目標視圖名稱。
+        edge1: {"index": int, "x": float, "y": float} — 第一條邊線。
+        edge2: {"index": int, "x": float, "y": float} — 第二條邊線。
+        text_position: {"x": float, "y": float}（mm）— 尺寸文字位置，選填。"""
+        try:
+            result = await sw.execute(
+                _add_linear_dimension,
+                view_name, edge1, edge2, text_position,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except SWError as e:
+            raise ToolError(f"add_dimension 失敗: {e}")
+        except Exception as e:
+            raise ToolError(f"add_dimension 未預期錯誤: {e}")
 
     @mcp.tool()
     async def auto_add_reference_dimensions(
@@ -428,6 +454,172 @@ def _get_view_edges(view_obj) -> list:
     return all_edges
 
 
+_M_TO_MM = 1000.0
+
+
+def _build_edge_info(edge, index: int) -> dict:
+    """從 COM edge 物件建立結構化邊線資訊（座標單位 mm）。"""
+    info = {"index": index, "type": "other"}
+
+    try:
+        curve = edge.GetCurve  # 屬性(dispatch)
+    except Exception:
+        return info
+
+    # 頂點座標（m）
+    start_pt = end_pt = None
+    try:
+        sv = edge.GetStartVertex
+        if sv is not None:
+            pt = sv.GetPoint
+            start_pt = (pt[0], pt[1], pt[2])
+    except Exception:
+        pass
+    try:
+        ev = edge.GetEndVertex
+        if ev is not None:
+            pt = ev.GetPoint
+            end_pt = (pt[0], pt[1], pt[2])
+    except Exception:
+        pass
+
+    try:
+        is_line = curve.IsLine
+    except Exception:
+        is_line = False
+    try:
+        is_circle = curve.IsCircle
+    except Exception:
+        is_circle = False
+
+    if is_line:
+        info["type"] = "line"
+        if start_pt:
+            info["start"] = {
+                "x": round(start_pt[0] * _M_TO_MM, 4),
+                "y": round(start_pt[1] * _M_TO_MM, 4),
+            }
+        if end_pt:
+            info["end"] = {
+                "x": round(end_pt[0] * _M_TO_MM, 4),
+                "y": round(end_pt[1] * _M_TO_MM, 4),
+            }
+        if start_pt and end_pt:
+            info["midpoint"] = {
+                "x": round((start_pt[0] + end_pt[0]) / 2 * _M_TO_MM, 4),
+                "y": round((start_pt[1] + end_pt[1]) / 2 * _M_TO_MM, 4),
+            }
+            dx = (end_pt[0] - start_pt[0]) * _M_TO_MM
+            dy = (end_pt[1] - start_pt[1]) * _M_TO_MM
+            dz = (end_pt[2] - start_pt[2]) * _M_TO_MM
+            info["length"] = round(math.sqrt(dx * dx + dy * dy + dz * dz), 4)
+    elif is_circle:
+        info["type"] = "circle" if start_pt is None else "arc"
+        try:
+            cp = curve.CircleParams  # (cx,cy,cz, ax,ay,az, radius)
+            info["midpoint"] = {
+                "x": round(cp[0] * _M_TO_MM, 4),
+                "y": round(cp[1] * _M_TO_MM, 4),
+            }
+            info["radius_mm"] = round(cp[6] * _M_TO_MM, 4)
+        except Exception:
+            pass
+        if start_pt:
+            info["start"] = {
+                "x": round(start_pt[0] * _M_TO_MM, 4),
+                "y": round(start_pt[1] * _M_TO_MM, 4),
+            }
+        if end_pt:
+            info["end"] = {
+                "x": round(end_pt[0] * _M_TO_MM, 4),
+                "y": round(end_pt[1] * _M_TO_MM, 4),
+            }
+
+    return info
+
+
+def _build_edges_info(edges) -> list[dict]:
+    """批次建立邊線資訊清單。"""
+    return [_build_edge_info(edge, i) for i, edge in enumerate(edges)]
+
+
+def _match_edge_by_index(
+    edges_info: list[dict], index: int, x: float, y: float, tolerance: float = 0.5,
+) -> tuple:
+    """索引優先匹配。回傳 (matched_index, "index") 或 (None, "fallback")。"""
+    if index < 0 or index >= len(edges_info):
+        return None, "fallback"
+
+    midpoint = edges_info[index].get("midpoint")
+    if midpoint is None:
+        return None, "fallback"
+
+    dist = math.sqrt((midpoint["x"] - x) ** 2 + (midpoint["y"] - y) ** 2)
+    if dist <= tolerance:
+        return index, "index"
+    return None, "fallback"
+
+
+def _match_edge_by_proximity(
+    edges_info: list[dict], x: float, y: float, max_distance: float = 2.0,
+) -> tuple:
+    """近鄰 fallback。回傳 (matched_index, distance) 或拋 SWError。"""
+    best_idx = None
+    best_dist = float("inf")
+
+    for info in edges_info:
+        midpoint = info.get("midpoint")
+        if midpoint is None:
+            continue
+        dist = math.sqrt((midpoint["x"] - x) ** 2 + (midpoint["y"] - y) ** 2)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = info["index"]
+
+    if best_idx is None or best_dist > max_distance:
+        raise SWError(
+            f"找不到距離 ({x}, {y}) 在 {max_distance}mm 內的邊線"
+            f"（最近距離: {best_dist:.2f}mm）"
+        )
+    return best_idx, best_dist
+
+
+def _resolve_edge(edges_info: list[dict], edge_spec: dict) -> tuple:
+    """統一入口：先 index 匹配，失敗走 proximity fallback。
+
+    edge_spec: {"index": int, "x": float, "y": float}
+    回傳: (matched_index, match_method)
+    """
+    index = edge_spec.get("index", -1)
+    x = edge_spec["x"]
+    y = edge_spec["y"]
+
+    matched_idx, method = _match_edge_by_index(edges_info, index, x, y)
+    if method == "index":
+        return matched_idx, "index"
+
+    matched_idx, _dist = _match_edge_by_proximity(edges_info, x, y)
+    return matched_idx, "proximity"
+
+
+_DIM_TEXT_OFFSET_MM = 15.0
+
+
+def _calc_text_position(
+    edges_info: list[dict], idx1: int, idx2: int,
+) -> dict:
+    """計算尺寸文字預設位置（mm）。
+
+    取兩條邊線中點的平均位置，往 Y 方向偏移。
+    """
+    mp1 = edges_info[idx1].get("midpoint", {"x": 0, "y": 0})
+    mp2 = edges_info[idx2].get("midpoint", {"x": 0, "y": 0})
+    return {
+        "x": round((mp1["x"] + mp2["x"]) / 2, 4),
+        "y": round((mp1["y"] + mp2["y"]) / 2 + _DIM_TEXT_OFFSET_MM, 4),
+    }
+
+
 def _insert_model_dimensions(
     view_name: str | None,
     dimension_type: str,
@@ -521,9 +713,7 @@ def _insert_model_dimensions(
 
 
 def _probe_drawing_edges(view_name: str | None) -> dict:
-    """診斷：測試 GetVisibleEntities2 + IEdge 方法鏈。"""
-    import pythoncom
-
+    """查詢 Drawing 視圖的可見邊線，回傳結構化邊線資訊。"""
     sw_conn = SWConnection.get_instance()
     app = sw_conn.get_app()
     drawing = app.ActiveDoc
@@ -535,351 +725,152 @@ def _probe_drawing_edges(view_name: str | None) -> dict:
     if doc_type is not None and doc_type != 3:
         raise SWError(f"目前的文件不是 Drawing（type={doc_type}）")
 
-    # 找視圖
-    view_names = _discover_view_names(drawing)
-    if not view_names:
-        raise SWError("找不到任何工程圖視圖")
+    # 取得視圖
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        # fallback: 用 _discover_view_names 暴力搜索
+        discovered = _discover_view_names(drawing)
+        if not discovered:
+            raise SWError("找不到任何工程圖視圖")
+        target = view_name or discovered[0]
+        views = _get_drawing_views(drawing, target)
+        if not views:
+            raise SWError(f"找不到視圖: {target}")
 
-    target = view_name or view_names[0]
-    drawing.ActivateView(target)
+    results = []
+    for vname, view_obj in views:
+        drawing.ActivateView(vname)
+        edges = _get_view_edges(view_obj)
+        edges_info = _build_edges_info(edges)
+        results.append({
+            "view": vname,
+            "edge_count": len(edges_info),
+            "edges": edges_info,
+        })
 
-    # 測試 1: 取得 IView 物件
-    probes = {"target_view": target, "tests": {}}
+    return {
+        "status": "done",
+        "views": results,
+    }
 
-    view_obj = None
-    all_view_names_in_chain = []
 
-    # 方法 A: _safe_get (可能被 early-binding 擋住)
+def _add_linear_dimension(
+    view_name: str,
+    edge1: dict,
+    edge2: dict,
+    text_position: dict | None,
+) -> dict:
+    """COM 操作：在兩條邊線間加線性尺寸。"""
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    drawing = app.ActiveDoc
+
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    doc_type = _safe_get(drawing, "GetType")
+    if doc_type is not None and doc_type != 3:
+        raise SWError(f"目前的文件不是 Drawing（type={doc_type}）")
+
+    # 取得視圖
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"找不到視圖: {view_name}")
+
+    vname, view_obj = views[0]
+    drawing.ActivateView(vname)
+
+    # 取邊線
+    edges = _get_view_edges(view_obj)
+    if not edges:
+        raise SWError(f"視圖 {vname} 沒有可見邊線")
+
+    # 匹配
+    edges_info = _build_edges_info(edges)
+    idx1, method1 = _resolve_edge(edges_info, edge1)
+    idx2, method2 = _resolve_edge(edges_info, edge2)
+
+    if idx1 == idx2:
+        raise SWError("兩條邊線不能相同（index 皆為 %d）" % idx1)
+
+    # 文字位置
+    if text_position:
+        text_x = text_position["x"] / _M_TO_MM
+        text_y = text_position["y"] / _M_TO_MM
+    else:
+        auto_pos = _calc_text_position(edges_info, idx1, idx2)
+        text_x = auto_pos["x"] / _M_TO_MM
+        text_y = auto_pos["y"] / _M_TO_MM
+
+    # 關閉尺寸值輸入對話框
+    orig_pref = None
     try:
-        v = _safe_get(drawing, "GetFirstView")
-        while v is not None:
-            vname = _safe_get(v, "GetName2")
-            all_view_names_in_chain.append(vname)
-            if vname == target:
-                view_obj = v
-                break
-            v = _safe_get(v, "GetNextView")
-        probes["tests"]["method_A_safe_get"] = (
-            f"OK" if view_obj
-            else f"鏈結名稱={all_view_names_in_chain}"
-        )
-    except Exception as e:
-        probes["tests"]["method_A_safe_get"] = f"FAIL: {e}"
-
-    # 方法 B: 強制 late-binding dispatch
-    if view_obj is None:
-        import win32com.client
-        try:
-            drawing_late = win32com.client.Dispatch(drawing._oleobj_)
-            v = drawing_late.GetFirstView()
-            late_names = []
-            while v is not None:
-                vname = v.GetName2()
-                late_names.append(vname)
-                if vname == target:
-                    view_obj = v
-                    break
-                v = v.GetNextView()
-            probes["tests"]["method_B_late_binding"] = (
-                f"OK" if view_obj
-                else f"鏈結名稱={late_names}"
-            )
-        except Exception as e:
-            probes["tests"]["method_B_late_binding"] = f"FAIL: {e}"
-
-    # 方法 C: 透過 FeatureTree（繞過 _safe_get，直接測試）
-    if view_obj is None:
-        # C1: 當屬性存取
-        try:
-            feat = drawing.FirstFeature
-            probes["tests"]["C1_FirstFeature_prop"] = (
-                f"type={type(feat).__name__}" if feat else "None"
-            )
-        except Exception as e:
-            probes["tests"]["C1_FirstFeature_prop"] = f"FAIL: {e}"
-            feat = None
-
-        # C2: 當方法呼叫
-        if feat is None:
-            try:
-                feat = drawing.FirstFeature()
-                probes["tests"]["C2_FirstFeature_call"] = (
-                    f"type={type(feat).__name__}" if feat else "None"
-                )
-            except Exception as e:
-                probes["tests"]["C2_FirstFeature_call"] = f"FAIL: {e}"
-                feat = None
-
-        # 遍歷 feature tree（含子特徵）— 全部用屬性存取
-        if feat is not None:
-            feat_names = []
-            try:
-                while feat is not None:
-                    try:
-                        type_name = feat.GetTypeName2
-                    except Exception:
-                        type_name = "?"
-                    try:
-                        feat_name = feat.Name
-                    except Exception:
-                        feat_name = "?"
-                    feat_names.append(f"{feat_name}({type_name})")
-
-                    # DrSheet 下有子特徵（視圖）
-                    if type_name == "DrSheet":
-                        try:
-                            sub = feat.GetFirstSubFeature
-                        except Exception:
-                            try:
-                                sub = feat.GetFirstSubFeature()
-                            except Exception:
-                                sub = None
-                        while sub is not None:
-                            try:
-                                st = sub.GetTypeName2
-                            except Exception:
-                                st = "?"
-                            try:
-                                sn = sub.Name
-                            except Exception:
-                                sn = "?"
-                            feat_names.append(f"  └ {sn}({st})")
-                            if st in ("AbsoluteView", "UnfoldedView",
-                                      "DrDrawingView") and sn == target:
-                                try:
-                                    view_obj = sub.GetSpecificFeature2()
-                                except Exception:
-                                    try:
-                                        view_obj = sub.GetSpecificFeature2
-                                    except Exception:
-                                        pass
-                                break
-                            try:
-                                sub = sub.GetNextSubFeature
-                            except Exception:
-                                try:
-                                    sub = sub.GetNextSubFeature()
-                                except Exception:
-                                    sub = None
-                        if view_obj is not None:
-                            break
-
-                    try:
-                        feat = feat.GetNextFeature
-                    except Exception:
-                        try:
-                            feat = feat.GetNextFeature()
-                        except Exception:
-                            feat = None
-
-                probes["tests"]["C_feature_tree"] = (
-                    f"OK, got IView"
-                    if view_obj
-                    else f"features={feat_names[:25]}"
-                )
-            except Exception as e:
-                probes["tests"]["C_feature_tree"] = (
-                    f"FAIL: {e}, partial={feat_names[:15]}"
-                )
-
-    if view_obj is None:
-        probes["tests"]["conclusion"] = "無法取得 IView 物件，後續測試跳過"
-        return probes
-
-    # 測試 2: GetVisibleEntities / GetVisibleEntities2
-    edges = None
-
-    # 2a: 取得 view 的 component（零件圖可能需要傳入）
-    comp = None
-    try:
-        # 可能是屬性或方法
-        comps = view_obj.GetVisibleComponents
-        if callable(comps):
-            comps = comps()
-        if comps and len(comps) > 0:
-            comp = comps[0]
-            probes["tests"]["GetVisibleComponents"] = (
-                f"OK, count={len(comps)}, type={type(comp).__name__}"
-            )
-        else:
-            probes["tests"]["GetVisibleComponents"] = "空或 None"
-    except Exception as e:
-        probes["tests"]["GetVisibleComponents"] = f"FAIL: {e}"
-
-    # 2b: 嘗試各種 GetVisibleEntities2 參數組合
-    attempts = [
-        ("comp", comp),
-        ("None", None),
-        ("Empty", pythoncom.Empty),
-    ]
-    for arg_name, first_arg in attempts:
-        try:
-            edges = view_obj.GetVisibleEntities2(first_arg, 1)
-            if edges is not None:
-                try:
-                    edge_count = len(edges)
-                except Exception:
-                    edge_count = "不可迭代"
-                probes["tests"][f"GetVisibleEntities2({arg_name})"] = (
-                    f"OK, count={edge_count}"
-                )
-                break
-            else:
-                probes["tests"][f"GetVisibleEntities2({arg_name})"] = "回傳 None"
-        except Exception as e:
-            probes["tests"][f"GetVisibleEntities2({arg_name})"] = f"FAIL: {e}"
-
-    # 2c: 嘗試 GetVisibleEntities（帶 entityType 參數）
-    if edges is None:
-        try:
-            edges = view_obj.GetVisibleEntities(1)  # swViewEntityType_Edge
-            if edges is not None:
-                try:
-                    edge_count = len(edges)
-                except Exception:
-                    edge_count = "不可迭代"
-                probes["tests"]["GetVisibleEntities(1)"] = f"OK, count={edge_count}"
-            else:
-                probes["tests"]["GetVisibleEntities(1)"] = "回傳 None"
-        except Exception as e:
-            probes["tests"]["GetVisibleEntities(1)"] = f"FAIL: {e}"
-
-    # 2d: 嘗試 GetPolylines 系列
-    if edges is None:
-        for method_name in ("GetPolylines7", "GetPolylines6",
-                            "GetPolylines5", "GetPolylines4"):
-            try:
-                method = getattr(view_obj, method_name)
-                if callable(method):
-                    polylines = method()
-                else:
-                    polylines = method
-                if polylines is not None:
-                    probes["tests"][method_name] = f"OK, len={len(polylines)}"
-                    break
-                else:
-                    probes["tests"][method_name] = "回傳 None"
-            except Exception as e:
-                probes["tests"][method_name] = f"FAIL: {e}"
-
-    if edges is None or (isinstance(edges, (list, tuple)) and len(edges) == 0):
-        probes["tests"]["conclusion"] = "無法取得邊線"
-        return probes
-
-    # 測試 3: IEdge 方法（取前 3 條邊）
-    def _com_get(obj, name):
-        """嘗試屬性存取和方法呼叫兩種方式。"""
-        # 先當屬性
-        try:
-            val = getattr(obj, name)
-            # 如果拿到的不是 callable，直接回傳
-            if not callable(val):
-                return val, "prop"
-            # 拿到 callable，可能是方法或 COM dispatch 物件
-            # 先檢查是否像 COM 物件（有 _oleobj_）
-            if hasattr(val, '_oleobj_'):
-                return val, "prop(dispatch)"
-            # 否則當方法呼叫
-            result = val()
-            return result, "method()"
-        except Exception as e1:
-            pass
-        # 再試直接呼叫
-        try:
-            val = getattr(obj, name)()
-            return val, "call()"
-        except Exception:
-            pass
-        return None, "NONE"
-
-    edge_samples = []
-    sample_edges = edges[:5] if len(edges) > 5 else edges
-
-    for i, edge in enumerate(sample_edges):
-        sample = {"index": i, "edge_type": type(edge).__name__}
-
-        # 列出 edge 物件上的屬性/方法
-        try:
-            edge_attrs = [a for a in dir(edge) if not a.startswith('_')][:20]
-            sample["attrs"] = edge_attrs
-        except Exception:
-            sample["attrs"] = "無法列舉"
-
-        # GetCurve
-        curve = None
-        curve_val, curve_how = _com_get(edge, "GetCurve")
-        if curve_val is not None:
-            curve = curve_val
-            sample["GetCurve"] = f"OK via {curve_how}, type={type(curve).__name__}"
-        else:
-            sample["GetCurve"] = "全部失敗"
-
-        # IsLine / IsCircle
-        if curve is not None:
-            for prop in ("IsLine", "IsCircle"):
-                val, how = _com_get(curve, prop)
-                sample[prop] = f"{val} via {how}"
-
-            # LineParams / CircleParams
-            for prop in ("LineParams", "CircleParams"):
-                val, how = _com_get(curve, prop)
-                if val is not None:
-                    try:
-                        sample[prop] = f"{list(val)[:6]} via {how}"
-                    except Exception:
-                        sample[prop] = f"{val} via {how}"
-
-        # GetStartVertex / GetEndVertex
-        for vmethod in ("GetStartVertex", "GetEndVertex"):
-            vertex, how = _com_get(edge, vmethod)
-            if vertex is not None:
-                pt, pt_how = _com_get(vertex, "GetPoint")
-                if pt is not None:
-                    try:
-                        sample[vmethod] = list(pt)[:3]
-                    except Exception:
-                        sample[vmethod] = f"{pt} via {pt_how}"
-                else:
-                    sample[vmethod] = f"vertex OK but GetPoint failed"
-            else:
-                sample[vmethod] = f"None via {how}"
-
-        edge_samples.append(sample)
-
-    probes["tests"]["edge_samples"] = edge_samples
-
-    # 測試 4: IView.GetOutline
-    try:
-        outline = _safe_get(view_obj, "GetOutline")
-        if outline is not None:
-            probes["tests"]["GetOutline"] = list(outline)
-        else:
-            probes["tests"]["GetOutline"] = "回傳 None"
-    except Exception as e:
-        probes["tests"]["GetOutline"] = f"FAIL: {e}"
-
-    # 測試 5: ModelToViewTransform
-    try:
-        xform = _safe_get(view_obj, "ModelToViewTransform")
-        probes["tests"]["ModelToViewTransform"] = (
-            "OK" if xform is not None else "回傳 None"
-        )
-    except Exception as e:
-        probes["tests"]["ModelToViewTransform"] = f"FAIL: {e}"
-
-    # 測試 6: IView.SelectEntity（用第一條邊）
-    try:
-        drawing.ClearSelection2(True)
+        orig_pref = app.GetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE)
+        app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, False)
     except Exception:
         pass
-    try:
-        ok = view_obj.SelectEntity(edges[0], False)
-        probes["tests"]["SelectEntity"] = f"OK, returned={ok}"
-    except Exception as e:
-        probes["tests"]["SelectEntity"] = f"FAIL: {e}"
 
-    probes["tests"]["conclusion"] = "所有測試完成"
-    return probes
+    try:
+        # 選取邊線
+        drawing.ClearSelection2(True)
+        ok1 = view_obj.SelectEntity(edges[idx1], False)
+        ok2 = view_obj.SelectEntity(edges[idx2], True)  # append
+
+        if not ok1 or not ok2:
+            raise SWError(f"SelectEntity 失敗: edge1={ok1}, edge2={ok2}")
+
+        # AddDimension
+        ext = drawing.Extension
+        disp_dim = None
+
+        for d in range(4):
+            try:
+                disp_dim = ext.AddDimension(text_x, text_y, 0, d)
+                if disp_dim is not None:
+                    break
+            except Exception:
+                pass
+
+        if disp_dim is None:
+            try:
+                disp_dim = drawing.AddDimension2(text_x, text_y, 0)
+            except Exception:
+                pass
+
+        if disp_dim is None:
+            raise SWError("AddDimension 回傳 None — 無法建立尺寸")
+
+        # 設定單位 mm / 2 位小數
+        try:
+            disp_dim.SetUnits2(
+                False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+            )
+            disp_dim.SetPrecision3(
+                2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+            )
+        except Exception:
+            pass
+
+        drawing.ClearSelection2(True)
+
+        return {
+            "status": "done",
+            "text_position": {
+                "x": round(text_x * _M_TO_MM, 4),
+                "y": round(text_y * _M_TO_MM, 4),
+            },
+            "match_method_edge1": method1,
+            "match_method_edge2": method2,
+        }
+
+    finally:
+        if orig_pref is not None:
+            try:
+                app.SetUserPreferenceToggle(
+                    SW_INPUT_DIM_VAL_ON_CREATE, orig_pref,
+                )
+            except Exception:
+                pass
 
 
 DIM_OFFSET_BASE = 0.015   # 15mm

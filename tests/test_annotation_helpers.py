@@ -325,3 +325,216 @@ def test_dedupe_circles_mixed_with_classify():
     radii = sorted([r for _, _, r in deduped])
     assert abs(radii[0] - 0.005) < 1e-6
     assert abs(radii[1] - 0.010) < 1e-6
+
+
+# --- edge info builder tests ---
+
+def test_build_edge_info_line():
+    """直線邊線：回傳 type=line + start/end/midpoint/length。"""
+    from tools.annotation import _build_edge_info
+    # start=(0,0,0) end=(0.1,0,0) → 100mm 水平線
+    edge = _make_mock_line_edge((0, 0, 0), (0.1, 0, 0))
+    info = _build_edge_info(edge, 0)
+    assert info["index"] == 0
+    assert info["type"] == "line"
+    assert abs(info["start"]["x"] - 0.0) < 0.01
+    assert abs(info["end"]["x"] - 100.0) < 0.01
+    assert abs(info["midpoint"]["x"] - 50.0) < 0.01
+    assert abs(info["midpoint"]["y"] - 0.0) < 0.01
+    assert abs(info["length"] - 100.0) < 0.01
+
+
+def test_build_edge_info_circle():
+    """完整圓邊線：回傳 type=circle + midpoint(=圓心) + radius_mm。"""
+    from tools.annotation import _build_edge_info
+    # center=(0.01, 0.02, 0), radius=0.005 → 5mm
+    edge = _make_mock_circle_edge_r((0.01, 0.02, 0), 0.005, full=True)
+    info = _build_edge_info(edge, 3)
+    assert info["index"] == 3
+    assert info["type"] == "circle"
+    assert abs(info["midpoint"]["x"] - 10.0) < 0.01
+    assert abs(info["midpoint"]["y"] - 20.0) < 0.01
+    assert abs(info["radius_mm"] - 5.0) < 0.01
+
+
+# --- edge matching tests ---
+
+def _make_edges_info():
+    """建立測試用 edges_info 清單（3 條邊線）。"""
+    return [
+        {"index": 0, "type": "line", "midpoint": {"x": 10.0, "y": 20.0}},
+        {"index": 1, "type": "line", "midpoint": {"x": 50.0, "y": 20.0}},
+        {"index": 2, "type": "line", "midpoint": {"x": 30.0, "y": 60.0}},
+    ]
+
+
+def test_match_by_index_hit():
+    """索引 + 座標吻合 → 回傳 (index, 'index')。"""
+    from tools.annotation import _match_edge_by_index
+    edges_info = _make_edges_info()
+    idx, method = _match_edge_by_index(edges_info, 0, 10.0, 20.0)
+    assert idx == 0
+    assert method == "index"
+
+
+def test_match_by_index_coords_drift():
+    """索引存在但座標偏移超過容差 → fallback。"""
+    from tools.annotation import _match_edge_by_index
+    edges_info = _make_edges_info()
+    idx, method = _match_edge_by_index(edges_info, 0, 15.0, 20.0, tolerance=0.5)
+    assert idx is None
+    assert method == "fallback"
+
+
+def test_match_by_index_out_of_range():
+    """索引超出範圍 → fallback。"""
+    from tools.annotation import _match_edge_by_index
+    edges_info = _make_edges_info()
+    idx, method = _match_edge_by_index(edges_info, 99, 10.0, 20.0)
+    assert idx is None
+    assert method == "fallback"
+
+
+def test_match_by_proximity_normal():
+    """近鄰匹配成功。"""
+    from tools.annotation import _match_edge_by_proximity
+    edges_info = _make_edges_info()
+    idx, dist = _match_edge_by_proximity(edges_info, 10.5, 20.0)
+    assert idx == 0
+    assert dist < 1.0
+
+
+def test_match_by_proximity_picks_nearest():
+    """多條邊線取最近的。"""
+    from tools.annotation import _match_edge_by_proximity
+    edges_info = _make_edges_info()
+    idx, dist = _match_edge_by_proximity(edges_info, 48.0, 20.0)
+    assert idx == 1  # (50, 20) 最近
+
+
+def test_match_by_proximity_too_far():
+    """全部超過 max_distance → 拋 SWError。"""
+    from tools.annotation import _match_edge_by_proximity
+    from errors import SWError
+    edges_info = _make_edges_info()
+    with pytest.raises(SWError, match="找不到"):
+        _match_edge_by_proximity(edges_info, 999.0, 999.0, max_distance=2.0)
+
+
+def test_resolve_edge_index_success():
+    """index 吻合 → 直接回傳。"""
+    from tools.annotation import _resolve_edge
+    edges_info = _make_edges_info()
+    idx, method = _resolve_edge(edges_info, {"index": 1, "x": 50.0, "y": 20.0})
+    assert idx == 1
+    assert method == "index"
+
+
+def test_resolve_edge_fallback_proximity():
+    """index 不吻合 → fallback proximity 成功。"""
+    from tools.annotation import _resolve_edge
+    edges_info = _make_edges_info()
+    # index=0 的 midpoint 是 (10,20)，但傳入 (50,20) → index 不吻合
+    # fallback 會找到 index=1 (50,20)
+    idx, method = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 20.0})
+    assert idx == 1
+    assert method == "proximity"
+
+
+def test_resolve_edge_both_fail():
+    """index + proximity 都失敗 → 拋 SWError。"""
+    from tools.annotation import _resolve_edge
+    from errors import SWError
+    edges_info = _make_edges_info()
+    with pytest.raises(SWError):
+        _resolve_edge(edges_info, {"index": 99, "x": 999.0, "y": 999.0})
+
+
+# --- probe structure test ---
+
+def test_probe_output_structure():
+    """驗證 _build_edges_info 產出的結構符合 probe 規格。"""
+    from tools.annotation import _build_edges_info
+    edges = [
+        _make_mock_line_edge((0, 0, 0), (0.1, 0, 0)),          # horizontal
+        _make_mock_line_edge((0, 0, 0), (0, 0.05, 0)),         # vertical
+        _make_mock_circle_edge_r((0.02, 0.03, 0), 0.005),      # circle
+    ]
+    infos = _build_edges_info(edges)
+    assert len(infos) == 3
+
+    # 檢查必要欄位
+    for info in infos:
+        assert "index" in info
+        assert "type" in info
+        assert info["type"] in ("line", "circle", "arc", "other")
+
+    # line 有 start/end/midpoint/length
+    line_info = infos[0]
+    assert line_info["type"] == "line"
+    assert "start" in line_info
+    assert "end" in line_info
+    assert "midpoint" in line_info
+    assert "length" in line_info
+    assert "x" in line_info["midpoint"]
+    assert "y" in line_info["midpoint"]
+
+    # circle 有 midpoint/radius_mm
+    circle_info = infos[2]
+    assert circle_info["type"] == "circle"
+    assert "midpoint" in circle_info
+    assert "radius_mm" in circle_info
+
+
+# --- add_dimension integration tests ---
+
+def _make_mock_edges_for_dim():
+    """建立兩條水平邊線的 mock（上下各一條）。"""
+    # 下方邊線: y=0, x: 0→100mm
+    edge_bottom = _make_mock_line_edge((0, 0, 0), (0.1, 0, 0))
+    # 上方邊線: y=50mm, x: 0→100mm
+    edge_top = _make_mock_line_edge((0, 0.05, 0), (0.1, 0.05, 0))
+    return [edge_bottom, edge_top]
+
+
+def test_add_dim_resolve_edges():
+    """probe edges_info → resolve 兩條邊線成功。"""
+    from tools.annotation import _build_edges_info, _resolve_edge
+    edges = _make_mock_edges_for_dim()
+    edges_info = _build_edges_info(edges)
+
+    # edge1: index=0, midpoint=(50, 0)
+    idx1, m1 = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 0.0})
+    assert idx1 == 0
+    assert m1 == "index"
+
+    # edge2: index=1, midpoint=(50, 50)
+    idx2, m2 = _resolve_edge(edges_info, {"index": 1, "x": 50.0, "y": 50.0})
+    assert idx2 == 1
+    assert m2 == "index"
+
+    assert idx1 != idx2
+
+
+def test_add_dim_auto_text_position():
+    """未指定 text_position 時自動計算。"""
+    from tools.annotation import _build_edges_info, _calc_text_position
+    edges = _make_mock_edges_for_dim()
+    edges_info = _build_edges_info(edges)
+
+    pos = _calc_text_position(edges_info, 0, 1)
+    # 兩邊中點: ((50+50)/2, (0+50)/2) = (50, 25)，再偏移
+    assert "x" in pos
+    assert "y" in pos
+
+
+def test_add_dim_same_edge_error():
+    """兩條邊線相同 → 拋錯。"""
+    from tools.annotation import _build_edges_info, _resolve_edge
+    from errors import SWError
+    edges = _make_mock_edges_for_dim()
+    edges_info = _build_edges_info(edges)
+
+    idx1, _ = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 0.0})
+    idx2, _ = _resolve_edge(edges_info, {"index": 0, "x": 50.0, "y": 0.0})
+    assert idx1 == idx2  # 驗證會選到同一條
