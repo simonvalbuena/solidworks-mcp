@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 SW_DOC_DRAWING = 3
 SW_DISPLAY_MODE_HIDDEN_GREYED = 6
+
+SW_DISPLAY_MODES = {
+    "wireframe": 1,              # swWIREFRAME
+    "hidden_lines_removed": 6,   # swHIDDEN_LINES_REMOVED
+    "shaded": 3,                 # swSHADED
+}
+
+_TEMP_VIEW_NAME = "_mcp_custom_temp"
 
 SW_DRAWING_PAPER_SIZE = {
     "A4": 8,
@@ -170,6 +179,36 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
             raise ToolError(f"insert_detail_view 失敗: {e}")
         except Exception as e:
             raise ToolError(f"insert_detail_view 未預期錯誤: {e}")
+
+    @mcp.tool()
+    async def insert_custom_view(
+        source_doc: str,
+        view_name: str | None = None,
+        orientation: dict | None = None,
+        position: dict | None = None,
+        scale: float | None = None,
+        display_mode: str = "hidden_lines_removed",
+        paper_size: str = "A3",
+    ) -> str:
+        """插入自訂角度視圖。支援具名視角和任意 XYZ 旋轉角度。
+        source_doc: 來源 part/assembly 文件路徑。
+        view_name: 具名視角（front/back/top/bottom/left/right/isometric/trimetric/dimetric），與 orientation 二擇一。
+        orientation: 自訂旋轉角度 {"x": 度, "y": 度, "z": 度}，XYZ extrinsic rotation，與 view_name 二擇一。
+        position: 視圖位置 {"x": mm, "y": mm}，預設紙張中央。
+        scale: 比例分母（如 2 表示 1:2），預設自動。
+        display_mode: 顯示模式（wireframe/hidden_lines_removed/shaded），預設 hidden_lines_removed。
+        paper_size: 圖紙大小（A4/A3/A2/A1/A0），用於預設位置計算。"""
+        try:
+            result = await sw.execute(
+                _insert_custom_view,
+                source_doc, view_name, orientation,
+                position, scale, display_mode, paper_size,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except SWError as e:
+            raise ToolError(f"insert_custom_view 失敗: {e}")
+        except Exception as e:
+            raise ToolError(f"insert_custom_view 未預期錯誤: {e}")
 
 
 def _create_drawing(template_path: str, paper_size: str) -> dict:
@@ -503,3 +542,178 @@ def _insert_detail_view(
         "scale": f"{dv_scale[0]:g}:{dv_scale[1]:g}",
         "parent_view": parent_view,
     }
+
+
+def _insert_custom_view(
+    source_doc: str,
+    view_name: str | None = None,
+    orientation: dict | None = None,
+    position: dict | None = None,
+    scale: float | None = None,
+    display_mode: str = "hidden_lines_removed",
+    paper_size: str = "A3",
+) -> dict:
+    """插入自訂角度視圖（路徑 1: 具名視角 / 路徑 2: 自訂角度）。"""
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    drawing = app.ActiveDoc
+
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    # 參數互斥檢查
+    if view_name is not None and orientation is not None:
+        raise SWError("view_name 和 orientation 不能同時指定")
+    if view_name is None and orientation is None:
+        raise SWError("必須指定 view_name 或 orientation 其中之一")
+
+    # display_mode 驗證
+    dm_value = SW_DISPLAY_MODES.get(display_mode)
+    if dm_value is None:
+        raise SWError(
+            f"不支援的 display_mode: {display_mode}，"
+            f"可用: {', '.join(SW_DISPLAY_MODES)}"
+        )
+
+    # 計算位置 (mm → meters)
+    if position is not None:
+        pos_x = position["x"] * _MM_TO_M
+        pos_y = position["y"] * _MM_TO_M
+    else:
+        sheet_w, sheet_h = PAPER_SIZE_MM.get(
+            paper_size.upper(), PAPER_SIZE_MM["A3"],
+        )
+        pos_x = sheet_w / 2 * _MM_TO_M
+        pos_y = sheet_h / 2 * _MM_TO_M
+
+    if view_name is not None:
+        # 路徑 1: 具名視角
+        sw_name = SW_VIEW_NAMES.get(view_name.lower())
+        if sw_name is None:
+            valid = ", ".join(SW_VIEW_NAMES.keys())
+            raise SWError(f"不支援的 view_name: {view_name}，可用: {valid}")
+
+        view = drawing.CreateDrawViewFromModelView3(
+            source_doc, sw_name, pos_x, pos_y, 0,
+        )
+        if view is None:
+            raise SWError(f"CreateDrawViewFromModelView3 失敗: {sw_name}")
+    else:
+        # 路徑 2: 自訂角度（Task 3 實作）
+        view = _create_custom_orientation_view(
+            app, drawing, source_doc, orientation, pos_x, pos_y,
+        )
+
+    # 共用後處理: display mode
+    try:
+        view.SetDisplayMode3(False, dm_value, False, False)
+    except Exception as e:
+        logger.warning("SetDisplayMode3 失敗（非致命）: %s", e)
+
+    # 共用後處理: scale
+    if scale is not None:
+        if scale <= 0:
+            raise SWError("比例必須大於 0")
+        try:
+            view.ScaleRatio = (1.0, scale)
+        except Exception as e:
+            logger.warning("ScaleRatio 設定失敗（非致命）: %s", e)
+
+    # Rebuild
+    try:
+        drawing.EditRebuild3()
+    except Exception:
+        pass
+
+    # 讀取結果
+    v_name = view.Name
+    v_pos = view.Position
+    v_scale = view.ScaleRatio
+
+    return {
+        "status": "done",
+        "view_name": v_name,
+        "position": {
+            "x": round(v_pos[0] * 1000, 1),
+            "y": round(v_pos[1] * 1000, 1),
+        },
+        "scale": f"{v_scale[0]:g}:{v_scale[1]:g}",
+        "display_mode": display_mode,
+    }
+
+
+def _create_custom_orientation_view(app, drawing, source_doc, orientation, pos_x, pos_y):
+    """路徑 2: 切到來源模型設定旋轉方向，建立暫存視圖，再切回 Drawing 使用。"""
+    drawing_title = drawing.GetTitle
+    source_name = os.path.basename(source_doc)
+
+    # 切到來源模型
+    model = app.ActivateDoc(source_name)
+    if model is None:
+        model = app.ActivateDoc(source_doc)
+    if model is None:
+        raise SWError(f"無法切換到來源模型: {source_doc}")
+
+    try:
+        # reset 到前視圖作為基準
+        model.ShowNamedView2("", 1)  # 1 = swFrontView
+
+        # 建構旋轉 MathTransform 並設定到模型視圖
+        model_view = model.ActiveView
+        transform = model_view.Orientation3
+
+        arr = _euler_to_transform_array(
+            orientation["x"], orientation["y"], orientation["z"],
+        )
+        # 注意：pywin32 late-binding 下 ArrayData 賦值若失敗，
+        # 需改用 win32com.client.VARIANT(pythoncom.VT_ARRAY|VT_R8, arr)
+        transform.ArrayData = arr
+        model_view.Orientation3 = transform
+
+        # 命名暫存視圖
+        model.NameView(_TEMP_VIEW_NAME)
+
+        # 切回 Drawing
+        app.ActivateDoc(drawing_title)
+
+        # 建立視圖
+        view = drawing.CreateDrawViewFromModelView3(
+            source_doc, _TEMP_VIEW_NAME, pos_x, pos_y, 0,
+        )
+        if view is None:
+            raise SWError("CreateDrawViewFromModelView3 自訂角度視圖失敗")
+
+        return view
+    finally:
+        # 清理暫存視圖（即使建立失敗也要清理）
+        try:
+            cleanup_model = app.ActivateDoc(source_name)
+            if cleanup_model is None:
+                cleanup_model = app.ActivateDoc(source_doc)
+            if cleanup_model is not None:
+                cleanup_model.DeleteNamedView(_TEMP_VIEW_NAME)
+            app.ActivateDoc(drawing_title)
+        except Exception as e:
+            logger.warning("清理暫存視圖失敗（非致命）: %s", e)
+
+
+def _euler_to_transform_array(x_deg: float, y_deg: float, z_deg: float) -> list[float]:
+    """Euler XYZ extrinsic rotation → SolidWorks MathTransform 16-element array.
+
+    Rotation order: X → Y → Z (extrinsic) = Rz * Ry * Rx.
+    Array layout: [R00,R01,R02,0, R10,R11,R12,0, R20,R21,R22,0, Tx,Ty,Tz,Scale]
+    """
+    x = math.radians(x_deg)
+    y = math.radians(y_deg)
+    z = math.radians(z_deg)
+
+    cx, sx = math.cos(x), math.sin(x)
+    cy, sy = math.cos(y), math.sin(y)
+    cz, sz = math.cos(z), math.sin(z)
+
+    return [
+        cz * cy,                      cz * sy * sx - sz * cx,     cz * sy * cx + sz * sx,   0.0,
+        sz * cy,                      sz * sy * sx + cz * cx,     sz * sy * cx - cz * sx,   0.0,
+        -sy,                          cy * sx,                     cy * cx,                   0.0,
+        0.0,                          0.0,                         0.0,                       1.0,
+    ]
