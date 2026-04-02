@@ -161,6 +161,29 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         except Exception as e:
             raise ToolError(f"auto_add_reference_dimensions 未預期錯誤: {e}")
 
+    @mcp.tool()
+    async def insert_balloon(
+        view_name: str,
+        component: str | None = None,
+        style: str = "circular",
+        auto_layout: bool = True,
+    ) -> str:
+        """在組立件工程圖視圖上插入氣球標註。
+        view_name: 目標視圖名稱。
+        component: 指定零件名稱，不指定則標全部零件。
+        style: 氣球樣式（circular/triangle/hexagon），預設 circular。
+        auto_layout: 自動排列氣球位置，預設 true。"""
+        try:
+            result = await sw.execute(
+                _insert_balloon,
+                view_name, component, style, auto_layout,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except SWError as e:
+            raise ToolError(f"insert_balloon 失敗: {e}")
+        except Exception as e:
+            raise ToolError(f"insert_balloon 未預期錯誤: {e}")
+
 
 def _safe_get(obj, name):
     """取得 COM 屬性/方法回傳值，處理 pywin32 方法/屬性歧義。"""
@@ -1584,3 +1607,162 @@ def _add_circle_dims(
             pass
 
     return dims
+
+
+# === insert_balloon ===
+
+# swBalloonStyle_e
+SW_BALLOON_STYLE = {
+    "circular": 1,   # swBS_Circular
+    "triangle": 2,   # swBS_Triangle
+    "hexagon": 4,    # swBS_Hexagon
+}
+
+# swBalloonLayoutStyle_e
+SW_BALLOON_LAYOUT_RIGHT = 4   # swDetailingBalloonLayout_Right
+SW_BALLOON_LAYOUT_NONE = 0    # swDetailingBalloonLayout_None
+
+# swBalloonTextContent_e
+SW_BALLOON_TEXT_ITEM_NUM = 1  # swBalloonTextItemNumber
+
+# swBalloonFit_e
+SW_BALLOON_FIT_TIGHTEST = 0   # swBF_Tightest
+
+
+def _extract_notes(notes) -> list:
+    """從 AutoBalloon 回傳的 VARIANT 中提取 Note 物件列表。
+
+    pywin32 late-binding 下 VARIANT 陣列可能為 None、tuple、或
+    需要 indexing 的 SAFEARRAY。
+    """
+    if notes is None:
+        return []
+    result = []
+    # 嘗試 1: 直接迭代（tuple/list）
+    try:
+        for note in notes:
+            result.append(note)
+        return result
+    except Exception:
+        pass
+    # 嘗試 2: indexing（SAFEARRAY）
+    try:
+        i = 0
+        while True:
+            try:
+                result.append(notes[i])
+                i += 1
+            except (IndexError, Exception):
+                break
+    except Exception:
+        pass
+    return result
+
+
+def _read_balloon_info(balloon_notes: list) -> list[dict]:
+    """從 Note 物件列表讀取氣球資訊（零件名稱、item number）。"""
+    balloons = []
+    for note in balloon_notes:
+        try:
+            balloon_texts = note.GetBomBalloonTexts(True)
+            item_number = ""
+            comp_name = ""
+            if balloon_texts is not None and len(balloon_texts) > 0:
+                bt = balloon_texts[0]
+                try:
+                    item_number = str(bt.GetText())
+                except Exception:
+                    pass
+                try:
+                    comp = bt.GetComponent()
+                    if comp is not None:
+                        comp_name = comp.Name2
+                except Exception:
+                    pass
+            balloons.append({
+                "component": comp_name,
+                "item_number": item_number,
+            })
+        except Exception as e:
+            logger.warning("讀取氣球資訊失敗: %s", e)
+    return balloons
+
+
+def _insert_balloon(
+    view_name: str,
+    component: str | None = None,
+    style: str = "circular",
+    auto_layout: bool = True,
+) -> dict:
+    """COM 操作：在視圖上插入氣球標註。
+
+    pywin32 late-binding 限制：
+    - SelectByID2 有參數類型問題，改用 SelectByID（5 參數版）
+    - AutoBalloon5/3 帶參數版本有 VARIANT_BOOL 類型不符，
+      改用 AutoBalloon()（無參數）+ AutoBalloon2（2 參數）fallback
+    - AutoBalloon 回傳的 VARIANT 陣列在 late-binding 下為 None，
+      氣球已建立但無法從回傳值取得 Note 物件
+    """
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+    drawing = app.ActiveDoc
+
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    # 驗證 style（預留給未來 AutoBalloon5 可用時）
+    style_val = SW_BALLOON_STYLE.get(style)
+    if style_val is None:
+        raise SWError(
+            f"不支援的 style: {style}，可用: {', '.join(SW_BALLOON_STYLE)}"
+        )
+
+    # 找視圖
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"找不到視圖: {view_name}")
+
+    # 啟動並選取視圖（AutoBalloon 需要 view 被選中）
+    drawing.ActivateView(view_name)
+    try:
+        drawing.SelectByID(view_name, "DRAWINGVIEW", 0, 0, 0)
+    except Exception as e:
+        logger.warning("SelectByID 失敗: %s", e)
+
+    # AutoBalloon — 帶參數版本有 VARIANT_BOOL 類型問題，
+    # 用無參數版 + 2 參數版 fallback
+    layout = SW_BALLOON_LAYOUT_RIGHT if auto_layout else SW_BALLOON_LAYOUT_NONE
+    notes = None
+    errors = []
+    try:
+        notes = drawing.AutoBalloon()
+    except Exception as e:
+        errors.append(f"AutoBalloon(): {e}")
+    if notes is None and errors:
+        try:
+            notes = drawing.AutoBalloon2(int(layout), 0)
+        except Exception as e:
+            errors.append(f"AutoBalloon2(): {e}")
+
+    if notes is None and errors:
+        raise SWError(f"AutoBalloon 失敗: {'; '.join(errors)}")
+
+    # 嘗試從回傳值讀取 Note 物件
+    balloon_notes = _extract_notes(notes)
+
+    # 遍歷 Note 取零件資訊
+    balloons = _read_balloon_info(balloon_notes)
+
+    # component 過濾（僅在有 Note 物件時可刪除）
+    if component is not None and balloon_notes:
+        keep = [b for b in balloons if b["component"] == component]
+        balloons = keep
+
+    drawing.ClearSelection2(True)
+
+    return {
+        "status": "done",
+        "balloon_count": len(balloons),
+        "balloons": balloons,
+        "view_name": view_name,
+    }
