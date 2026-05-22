@@ -184,6 +184,29 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         except Exception as e:
             raise ToolError(f"insert_balloon 未預期錯誤: {e}")
 
+    @mcp.tool()
+    async def insert_bom_table(
+        view_name: str,
+        x: float,
+        y: float,
+        drawing_name: str | None = None,
+    ) -> str:
+        """在組立件工程圖視圖上插入 BOM 表（Top-Level Only）。
+        view_name: 目標視圖名稱（須參考組立件）。
+        x: 放置 X 座標（單位 mm）。
+        y: 放置 Y 座標（單位 mm）。
+        drawing_name: 目標 drawing，省略則用 active doc。"""
+        try:
+            result = await sw.execute(
+                _insert_bom_table,
+                view_name, x, y, drawing_name,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except SWError as e:
+            raise ToolError(f"insert_bom_table 失敗: {e}")
+        except Exception as e:
+            raise ToolError(f"insert_bom_table 未預期錯誤: {e}")
+
 
 def _safe_get(obj, name):
     """取得 COM 屬性/方法回傳值，處理 pywin32 方法/屬性歧義。"""
@@ -1765,4 +1788,108 @@ def _insert_balloon(
         "balloon_count": len(balloons),
         "balloons": balloons,
         "view_name": view_name,
+    }
+
+
+# === insert_bom_table ===
+
+# swBomType_e
+SW_BOM_TOP_LEVEL_ONLY = 1   # swBomTable_TopLevelOnly
+SW_BOM_PARTS_ONLY = 2        # swBomTable_PartsOnly
+SW_BOM_INDENTED = 3          # swBomTable_Indented
+
+
+def _insert_bom_table(
+    view_name: str,
+    x: float,
+    y: float,
+    drawing_name: str | None = None,
+) -> dict:
+    """COM 操作：在組立件工程圖視圖上插入 Top-Level Only BOM 表。
+
+    pywin32 late-binding 踩坑：
+    - InsertBomTable4 帶 7 參數可能因 VARIANT byref 失敗 → 退化到 InsertBomTable3
+    """
+    sw_conn = SWConnection.get_instance()
+    app = sw_conn.get_app()
+
+    if drawing_name:
+        try:
+            app.ActivateDoc2(drawing_name, True, 0)
+        except Exception as e:
+            raise SWError(f"切換到 drawing '{drawing_name}' 失敗: {e}")
+
+    drawing = app.ActiveDoc
+    if drawing is None:
+        raise SWError("目前沒有開啟的 Drawing 文件")
+
+    doc_type = _safe_get(drawing, "GetType")
+    if doc_type is not None and doc_type != 3:
+        raise SWError("Active document is not a drawing")
+
+    # 找視圖
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"View '{view_name}' not found")
+
+    vname, view_obj = views[0]
+
+    # 驗證視圖參考的是組立件
+    try:
+        ref_doc = view_obj.ReferencedDocument
+        if ref_doc is None:
+            raise SWError(f"View '{view_name}' has no referenced document")
+        ref_type = _safe_get(ref_doc, "GetType")
+        if ref_type != 2:
+            raise SWError(
+                f"View '{view_name}' does not reference an assembly "
+                f"(type={ref_type})"
+            )
+    except SWError:
+        raise
+    except Exception as e:
+        raise SWError(f"檢查視圖參考文件失敗: {e}")
+
+    # 啟動並選取視圖
+    if not drawing.ActivateView(vname):
+        logger.warning("ActivateView 失敗: %s", vname)
+    try:
+        drawing.SelectByID(vname, "DRAWINGVIEW", 0, 0, 0)
+    except Exception as e:
+        logger.warning("SelectByID 失敗: %s", e)
+
+    # mm → meters
+    x_m = x / _M_TO_MM
+    y_m = y / _M_TO_MM
+
+    # 主路徑 InsertBomTable4
+    bom_table = None
+    errors = []
+    try:
+        bom_table = drawing.InsertBomTable4(
+            False, x_m, y_m, 0, SW_BOM_TOP_LEVEL_ONLY, "", "",
+        )
+    except Exception as e:
+        errors.append(f"InsertBomTable4: {e}")
+
+    # 退化 InsertBomTable3
+    if bom_table is None:
+        try:
+            bom_table = drawing.InsertBomTable3(
+                False, x_m, y_m, 0, SW_BOM_TOP_LEVEL_ONLY, "", "",
+            )
+        except Exception as e:
+            errors.append(f"InsertBomTable3: {e}")
+
+    if bom_table is None:
+        raise SWError(
+            "Failed to insert BOM table (both API versions returned None): "
+            + "; ".join(errors)
+        )
+
+    table_name = _safe_get(bom_table, "Name") or ""
+
+    return {
+        "status": "done",
+        "table_name": table_name,
     }
