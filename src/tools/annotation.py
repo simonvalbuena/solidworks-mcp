@@ -170,9 +170,12 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
     ) -> str:
         """在組立件工程圖視圖上插入氣球標註。
         view_name: 目標視圖名稱。
-        component: 指定零件名稱，不指定則標全部零件。
+        component: 指定零件名稱（包含比對、不分大小寫），不指定則標全部零件；
+                   不符的氣球建立後會被刪除。
         style: 氣球樣式（circular/triangle/hexagon），預設 circular。
-        auto_layout: 自動排列氣球位置，預設 true。"""
+        auto_layout: 自動排列氣球位置，預設 true。
+        回傳 balloons 含每顆氣球的零件名稱與 item number；
+        COM 退化路徑或讀取失敗時以 warnings 欄位告知。"""
         try:
             result = await sw.execute(
                 _insert_balloon,
@@ -1708,7 +1711,98 @@ def _read_balloon_info(balloon_notes: list) -> list[dict]:
             })
         except Exception as e:
             logger.warning("讀取氣球資訊失敗: %s", e)
+            balloons.append({"component": "", "item_number": ""})
     return balloons
+
+
+def _com_get(obj, name):
+    """讀取 COM 成員，處理 late-binding 屬性/方法歧義（含非 COM 物件回傳值）。
+
+    與 _com_prop_or_method 不同：適用回傳字串/bool/陣列的成員。
+    先嘗試方法呼叫，TypeError（值非 callable，屬性形式）時回傳值本身。
+    COM 呼叫本身的錯誤向上拋，由呼叫端決定兜底。
+    """
+    attr = getattr(obj, name)
+    try:
+        return attr()
+    except TypeError:
+        return attr
+
+
+def _get_view_note_names(view) -> set[str]:
+    """取得視圖上所有 note 名稱集合（建立前快照，diff 兜底用）。"""
+    names: set[str] = set()
+    for note in _extract_notes(_com_get(view, "GetNotes")):
+        try:
+            names.add(str(_com_get(note, "GetName")))
+        except Exception as e:
+            logger.debug("GetName 失敗: %s", e)
+    return names
+
+
+def _collect_new_balloon_notes(view, before_names: set[str]) -> list:
+    """diff 出建立後新增、且為 BOM balloon 的 Note 物件。"""
+    result = []
+    for note in _extract_notes(_com_get(view, "GetNotes")):
+        try:
+            name = str(_com_get(note, "GetName"))
+        except Exception:
+            continue
+        if name in before_names:
+            continue
+        try:
+            if not bool(_com_get(note, "IsBomBalloon")):
+                continue
+        except Exception:
+            # 無法判斷時，新增的 note 視為本次氣球
+            logger.debug("IsBomBalloon 判斷失敗，視為氣球: %s", name)
+        result.append(note)
+    return result
+
+
+def _delete_balloon_note(drawing, note, view_name: str) -> bool:
+    """刪除單顆氣球 Note。
+
+    用 SelectByID（5 參數版，late-binding 安全）+ EditDelete；
+    名稱先試 view 限定格式再試裸名。
+    """
+    try:
+        name = str(_com_get(note, "GetName"))
+    except Exception as e:
+        logger.warning("取得氣球名稱失敗: %s", e)
+        return False
+    drawing.ClearSelection2(True)
+    for sel_name in (f"{name}@{view_name}", name):
+        try:
+            ok = drawing.SelectByID(sel_name, "NOTE", 0, 0, 0)
+        except Exception as e:
+            logger.debug("SelectByID(%s) 失敗: %s", sel_name, e)
+            continue
+        if ok:
+            try:
+                drawing.EditDelete()
+                return True
+            except Exception as e:
+                logger.warning("EditDelete 失敗: %s", e)
+                return False
+    return False
+
+
+def _apply_balloon_options(opts, style_val: int, layout: int) -> None:
+    """以 property 賦值設定 AutoBalloonOptions。
+
+    避開舊式 positional VARIANT_BOOL 的 DISP_E_TYPEMISMATCH
+    （MathTransform ArrayData property 賦值有成功前例）。
+    屬性名稱皆經 SW 2021 本機 API 文件核對（IAutoBalloonOptions，
+    InsertMagneticLine 為單數）。
+    只設必要屬性，減少 late-binding 下屬性名不符直接炸掉主路徑的面積；
+    任何一個賦值失敗即整個主路徑失敗，由呼叫端退化。
+    """
+    opts.Layout = layout
+    opts.Style = style_val
+    opts.Size = SW_BALLOON_FIT_TIGHTEST
+    opts.UpperTextContent = SW_BALLOON_TEXT_ITEM_NUM
+    opts.InsertMagneticLine = False
 
 
 def _insert_balloon(
@@ -1719,12 +1813,13 @@ def _insert_balloon(
 ) -> dict:
     """COM 操作：在視圖上插入氣球標註。
 
-    pywin32 late-binding 限制：
-    - SelectByID2 有參數類型問題，改用 SelectByID（5 參數版）
-    - AutoBalloon5/3 帶參數版本有 VARIANT_BOOL 類型不符，
-      改用 AutoBalloon()（無參數）+ AutoBalloon2（2 參數）fallback
-    - AutoBalloon 回傳的 VARIANT 陣列在 late-binding 下為 None，
-      氣球已建立但無法從回傳值取得 Note 物件
+    pywin32 late-binding 限制與對策：
+    - 主路徑用 IDrawingDoc::AutoBalloon5(AutoBalloonOptions) +
+      IDrawingDoc::CreateAutoBalloonOptions（property 賦值避開
+      positional VARIANT_BOOL 類型不符），style/auto_layout 在主路徑下生效
+    - 主路徑失敗退化到 AutoBalloon()/AutoBalloon2()，
+      style/auto_layout 不套用並以 warnings 告知
+    - 視圖選取維持 SelectByID（5 參數版），SelectByID2 有類型問題
     """
     sw_conn = SWConnection.get_instance()
     app = sw_conn.get_app()
@@ -1733,7 +1828,6 @@ def _insert_balloon(
     if drawing is None:
         raise SWError("目前沒有開啟的 Drawing 文件")
 
-    # 驗證 style（預留給未來 AutoBalloon5 可用時）
     style_val = SW_BALLOON_STYLE.get(style)
     if style_val is None:
         raise SWError(
@@ -1745,6 +1839,17 @@ def _insert_balloon(
     if not views:
         raise SWError(f"找不到視圖: {view_name}")
 
+    view_obj = views[0][1]
+
+    # 建立前快照：視圖既有 note 名稱（回傳值不可用時 diff 兜底）
+    before_names: set[str] | None = None
+    try:
+        before_names = _get_view_note_names(view_obj)
+    except Exception as e:
+        logger.warning("建立前 note 快照失敗: %s", e)
+
+    warnings: list[str] = []
+
     # 啟動並選取視圖（AutoBalloon 需要 view 被選中）
     drawing.ActivateView(view_name)
     try:
@@ -1752,43 +1857,84 @@ def _insert_balloon(
     except Exception as e:
         logger.warning("SelectByID 失敗: %s", e)
 
-    # AutoBalloon — 帶參數版本有 VARIANT_BOOL 類型問題，
-    # 用無參數版 + 2 參數版 fallback
     layout = SW_BALLOON_LAYOUT_RIGHT if auto_layout else SW_BALLOON_LAYOUT_NONE
+
+    # 建立：主路徑 AutoBalloon5(Options)，退化 AutoBalloon()/AutoBalloon2()
+    # CreateAutoBalloonOptions / AutoBalloon5 皆掛在 IDrawingDoc（SW 2021 API）
     notes = None
+    fallback_used = False
     errors = []
     try:
-        notes = drawing.AutoBalloon()
+        opts = drawing.CreateAutoBalloonOptions()
+        _apply_balloon_options(opts, style_val, layout)
+        notes = drawing.AutoBalloon5(opts)
     except Exception as e:
-        errors.append(f"AutoBalloon(): {e}")
-    if notes is None and errors:
+        errors.append(f"AutoBalloon5(opts): {e}")
         try:
-            notes = drawing.AutoBalloon2(int(layout), 0)
-        except Exception as e:
-            errors.append(f"AutoBalloon2(): {e}")
+            notes = drawing.AutoBalloon()
+            fallback_used = True
+        except Exception as e2:
+            errors.append(f"AutoBalloon(): {e2}")
+            try:
+                notes = drawing.AutoBalloon2(int(layout), 0)
+                fallback_used = True
+            except Exception as e3:
+                errors.append(f"AutoBalloon2(): {e3}")
+                raise SWError(f"氣球建立失敗: {'; '.join(errors)}")
 
-    if notes is None and errors:
-        raise SWError(f"AutoBalloon 失敗: {'; '.join(errors)}")
+    if fallback_used:
+        warnings.append("style/auto_layout 未套用（退化路徑）")
 
-    # 嘗試從回傳值讀取 Note 物件
+    # 讀取：回傳值優先，None/空時 annotation diff 兜底
     balloon_notes = _extract_notes(notes)
+    read_failed = False
+    if not balloon_notes:
+        if before_names is None:
+            read_failed = True
+        else:
+            try:
+                balloon_notes = _collect_new_balloon_notes(
+                    view_obj, before_names,
+                )
+            except Exception as e:
+                logger.warning("annotation diff 讀取失敗: %s", e)
+                read_failed = True
+    if read_failed:
+        warnings.append("氣球可能已建立但無法讀取資訊")
 
     # 遍歷 Note 取零件資訊
     balloons = _read_balloon_info(balloon_notes)
 
-    # component 過濾（僅在有 Note 物件時可刪除）
-    if component is not None and balloon_notes:
-        keep = [b for b in balloons if b["component"] == component]
-        balloons = keep
+    # component 過濾：標全部、刪不符（包含比對，Name2 帶 instance 後綴全名）
+    if component is not None:
+        if read_failed:
+            warnings.append("component 過濾未執行（無法讀取氣球資訊）")
+        else:
+            kept = []
+            for note, info in zip(balloon_notes, balloons):
+                if not info["component"]:
+                    # 讀不到零件名的氣球不刪，避免誤殺
+                    kept.append(info)
+                    warnings.append("無法判斷氣球零件名稱，保留該氣球")
+                    continue
+                if component.lower() in info["component"].lower():
+                    kept.append(info)
+                    continue
+                if not _delete_balloon_note(drawing, note, view_name):
+                    warnings.append(f"刪除氣球失敗: {info['component']}")
+            balloons = kept
 
     drawing.ClearSelection2(True)
 
-    return {
+    result = {
         "status": "done",
         "balloon_count": len(balloons),
         "balloons": balloons,
         "view_name": view_name,
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 # === insert_bom_table ===
