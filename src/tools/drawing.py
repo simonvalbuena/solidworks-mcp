@@ -16,7 +16,6 @@ from sw_connection import SWConnection
 logger = logging.getLogger(__name__)
 
 SW_DOC_DRAWING = 3
-SW_DISPLAY_MODE_HIDDEN_GREYED = 6
 
 SW_DISPLAY_MODES = {
     "wireframe": 1,              # swWIREFRAME
@@ -289,7 +288,7 @@ def _insert_standard_views(
 
         try:
             view.SetDisplayMode3(
-                False, SW_DISPLAY_MODE_HIDDEN_GREYED, False, False,
+                False, SW_DISPLAY_MODES["hidden_lines_removed"], False, False,
             )
         except Exception as e:
             logger.warning("SetDisplayMode3 失敗（非致命）: %s", e)
@@ -365,6 +364,9 @@ def _insert_section_view(
     if drawing is None:
         raise SWError("目前沒有開啟的 Drawing 文件")
 
+    if scale is not None and scale <= 0:
+        raise SWError("比例分母必須大於 0")
+
     # 找父視圖
     from tools.annotation import _get_drawing_views
 
@@ -413,8 +415,6 @@ def _insert_section_view(
 
     # 設定比例
     if scale is not None:
-        if scale <= 0:
-            raise SWError("比例分母必須大於 0")
         try:
             section_view.ScaleRatio = (1.0, scale)
         except Exception:
@@ -575,6 +575,9 @@ def _insert_custom_view(
             f"可用: {', '.join(SW_DISPLAY_MODES)}"
         )
 
+    if scale is not None and scale <= 0:
+        raise SWError("比例分母必須大於 0")
+
     # 計算位置 (mm → meters)
     if position is not None:
         pos_x = position["x"] * _MM_TO_M
@@ -612,8 +615,6 @@ def _insert_custom_view(
 
     # 共用後處理: scale
     if scale is not None:
-        if scale <= 0:
-            raise SWError("比例必須大於 0")
         try:
             view.ScaleRatio = (1.0, scale)
         except Exception as e:

@@ -160,6 +160,27 @@ def test_custom_view_invalid_display_mode():
             )
 
 
+def test_custom_view_negative_scale_before_com():
+    """scale <= 0 在建立 view 前就 raise，不殘留無用 view。"""
+    from errors import SWError
+
+    with patch("tools.drawing.SWConnection") as MockSW:
+        inst = MockSW.get_instance.return_value
+        app = _make_mock_com()
+        drawing = _make_mock_com()
+        app.ActiveDoc = drawing
+        inst.get_app.return_value = app
+
+        with pytest.raises(SWError, match="比例分母必須大於 0"):
+            _insert_custom_view(
+                source_doc="C:\\test.sldprt",
+                view_name="front",
+                scale=-1.0,
+            )
+
+    drawing.CreateDrawViewFromModelView3.assert_not_called()
+
+
 # === Named view path tests ===
 
 

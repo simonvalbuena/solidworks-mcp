@@ -195,6 +195,38 @@ def test_insert_section_view_parent_not_found():
             )
 
 
+# --- Test 3b: scale 提前驗證 ---
+
+def test_insert_section_view_negative_scale_before_com():
+    """scale <= 0 在畫剖面線/建 view 前就 raise，不殘留無用 view。"""
+    from tools.drawing import _insert_section_view
+    from errors import SWError
+
+    drawing, _ = _make_mock_drawing_with_views([
+        ("工程視圖1", [0.4, 0.4, 0.5, 0.5]),
+    ])
+    sketch_mgr = _make_mock_com()
+    type(drawing).SketchManager = property(lambda self: sketch_mgr)
+
+    with patch("tools.drawing.SWConnection") as MockSW:
+        inst = MockSW.get_instance.return_value
+        inst.get_app.return_value = _make_mock_com()
+        inst.get_app.return_value.ActiveDoc = drawing
+
+        with pytest.raises(SWError, match="比例分母必須大於 0"):
+            _insert_section_view(
+                parent_view="工程視圖1",
+                section_line={
+                    "start": {"x": 100, "y": 200},
+                    "end": {"x": 100, "y": 100},
+                },
+                scale=-1.0,
+            )
+
+    sketch_mgr.CreateLine.assert_not_called()
+    drawing.CreateSectionViewAt5.assert_not_called()
+
+
 # === insert_detail_view tests ===
 
 
