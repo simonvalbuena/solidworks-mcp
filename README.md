@@ -8,7 +8,7 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-An MCP server that lets Claude drive **SolidWorks 2021** to create engineering drawings — over your LAN, through the pywin32 COM API.
+An MCP server that lets Claude — or any MCP client that speaks Streamable HTTP — drive **SolidWorks 2021** to create engineering drawings over your LAN, through the pywin32 COM API.
 
 Open a part, generate first-angle standard views, add dimensions and balloons, insert a BOM table, then export to PDF — all from a Claude conversation.
 
@@ -46,7 +46,7 @@ SolidWorks COM must be driven from a single STA thread. All tool handlers are as
 
 - Windows 10/11 host with **SolidWorks 2021** installed
 - **Python 3.10+**
-- An MCP client that supports Streamable HTTP (e.g. Claude Code) on the same **trusted LAN**
+- An MCP client that supports Streamable HTTP (e.g. Claude Code, Codex CLI, Gemini CLI, Cursor — see [Compatible MCP clients](#compatible-mcp-clients)) on the same **trusted LAN**
 - Optional: a drawing template (`.drwdot`) and an SMB shared folder for large screenshots / PDFs
 
 > Only SolidWorks 2021 has been tested. Other versions may work since the COM API is largely stable, but no guarantees.
@@ -99,6 +99,25 @@ claude mcp add --transport http solidworks http://<sw-host>:8080/mcp
 ```
 
 Then just ask Claude: *"Open bracket.sldprt and create a first-angle 3-view drawing with dimensions, then export it as PDF."*
+
+## Compatible MCP clients
+
+Any MCP client that supports **Streamable HTTP** and runs on your machine (or inside the LAN) can connect. Verified examples:
+
+| Client | Config |
+|--------|--------|
+| Claude Code | `claude mcp add --transport http solidworks http://<sw-host>:8080/mcp` |
+| Codex CLI | `config.toml`: `[mcp_servers.solidworks]`<br>`url = "http://<sw-host>:8080/mcp"` |
+| Gemini CLI | `gemini mcp add --transport http solidworks http://<sw-host>:8080/mcp` |
+| Cursor | `mcp.json`: `{ "mcpServers": { "solidworks": { "url": "http://<sw-host>:8080/mcp" } } }` |
+| VS Code Copilot | `.vscode/mcp.json`: `{ "servers": { "solidworks": { "type": "http", "url": "http://<sw-host>:8080/mcp" } } }` |
+| Cline | `cline_mcp_settings.json`: `{ "mcpServers": { "solidworks": { "type": "streamableHttp", "url": "http://<sw-host>:8080/mcp" } } }` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json`: `{ "mcpServers": { "solidworks": { "serverUrl": "http://<sw-host>:8080/mcp" } } }` |
+| Continue / Zed / JetBrains AI Assistant / opencode / Goose | see their MCP docs (`url` / `uri` field) |
+
+Agent frameworks work too: OpenAI Agents SDK (`MCPServerStreamableHttp`), LangChain (`langchain-mcp-adapters`).
+
+> Cloud-brokered connectors cannot reach a LAN-only server: Claude Desktop / claude.ai custom connectors and the Anthropic Messages API MCP connector all connect from the vendor's cloud, which is exactly what the trusted-LAN security model blocks.
 
 ## Configuration
 

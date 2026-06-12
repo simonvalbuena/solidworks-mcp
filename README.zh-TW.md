@@ -8,7 +8,7 @@
 
 [English](README.md) | 繁體中文
 
-讓 Claude 操作 **SolidWorks 2021** 出工程圖的 MCP server — 透過 pywin32 COM API，從區網即可呼叫。
+讓 Claude——或任何支援 Streamable HTTP 的 MCP client——操作 **SolidWorks 2021** 出工程圖的 MCP server，透過 pywin32 COM API，從區網即可呼叫。
 
 開零件、建第一角法標準視圖、加尺寸標註與氣球、插 BOM 表、輸出 PDF — 全部在 Claude 對話中完成。
 
@@ -46,7 +46,7 @@ SolidWorks COM 必須在同一個 STA 執行緒操作。所有 tool handler 是 
 
 - Windows 10/11 主機，已安裝 **SolidWorks 2021**
 - **Python 3.10+**
-- 支援 Streamable HTTP 的 MCP client（如 Claude Code），與主機在同一個**信任區網**
+- 支援 Streamable HTTP 的 MCP client（如 Claude Code、Codex CLI、Gemini CLI、Cursor，見[相容的 MCP clients](#相容的-mcp-clients)），與主機在同一個**信任區網**
 - 選用：工程圖模板（`.drwdot`）與 SMB 共享資料夾（放大型截圖／PDF）
 
 > 僅在 SolidWorks 2021 實測過。COM API 大致穩定，其他版本可能可用但不保證。
@@ -99,6 +99,25 @@ claude mcp add --transport http solidworks http://<sw-host>:8080/mcp
 ```
 
 接著直接對 Claude 說：「開啟 bracket.sldprt，建第一角法三視圖加尺寸標註，輸出 PDF。」
+
+## 相容的 MCP clients
+
+任何支援 **Streamable HTTP**、且在你的機器（或區網內）執行的 MCP client 都能連線。已查證的例子：
+
+| Client | 設定 |
+|--------|------|
+| Claude Code | `claude mcp add --transport http solidworks http://<sw-host>:8080/mcp` |
+| Codex CLI | `config.toml`：`[mcp_servers.solidworks]`<br>`url = "http://<sw-host>:8080/mcp"` |
+| Gemini CLI | `gemini mcp add --transport http solidworks http://<sw-host>:8080/mcp` |
+| Cursor | `mcp.json`：`{ "mcpServers": { "solidworks": { "url": "http://<sw-host>:8080/mcp" } } }` |
+| VS Code Copilot | `.vscode/mcp.json`：`{ "servers": { "solidworks": { "type": "http", "url": "http://<sw-host>:8080/mcp" } } }` |
+| Cline | `cline_mcp_settings.json`：`{ "mcpServers": { "solidworks": { "type": "streamableHttp", "url": "http://<sw-host>:8080/mcp" } } }` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json`：`{ "mcpServers": { "solidworks": { "serverUrl": "http://<sw-host>:8080/mcp" } } }` |
+| Continue / Zed / JetBrains AI Assistant / opencode / Goose | 見各自的 MCP 文件（`url` / `uri` 欄位） |
+
+Agent 框架也可以：OpenAI Agents SDK（`MCPServerStreamableHttp`）、LangChain（`langchain-mcp-adapters`）。
+
+> 雲端代理連線的 connector 連不到僅限區網的 server：Claude Desktop / claude.ai 的 custom connectors 與 Anthropic Messages API 的 MCP connector 都是從廠商雲端發起連線——而這正是信任區網安全模型要擋下的。
 
 ## 設定
 
