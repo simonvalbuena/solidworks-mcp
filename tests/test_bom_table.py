@@ -142,6 +142,25 @@ def test_fallback_to_v3():
     drawing.InsertBomTable3.assert_called_once()
 
 
+def test_v4_returns_none_fallback_to_v3():
+    """InsertBomTable4 回 None（不拋例外）時退化到 InsertBomTable3。"""
+    drawing = _make_mock_drawing_with_assembly_view("工程視圖1")
+    drawing.InsertBomTable4.return_value = None
+    bom_table = _make_mock_com(Name="Bill of Materials1")
+    drawing.InsertBomTable3.return_value = bom_table
+
+    with patch("tools.annotation.SWConnection") as MockSW:
+        inst = MockSW.get_instance.return_value
+        inst.get_app.return_value = _make_mock_com(ActiveDoc=drawing)
+
+        result = _insert_bom_table("工程視圖1", 250, 180, None)
+
+    assert result["status"] == "done"
+    assert result["table_name"] == "Bill of Materials1"
+    drawing.InsertBomTable4.assert_called_once()
+    drawing.InsertBomTable3.assert_called_once()
+
+
 def test_both_versions_fail_raises():
     """v4 與 v3 都失敗 → SWError。"""
     from errors import SWError
@@ -153,7 +172,7 @@ def test_both_versions_fail_raises():
         inst = MockSW.get_instance.return_value
         inst.get_app.return_value = _make_mock_com(ActiveDoc=drawing)
 
-        with pytest.raises(SWError, match="both API versions returned None"):
+        with pytest.raises(SWError, match="no exceptions raised"):
             _insert_bom_table("工程視圖1", 0, 0, None)
 
 

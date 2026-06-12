@@ -2,7 +2,7 @@
 domain: bom-table
 status: active
 created: 2026-05-22
-last_modified: 2026-05-22
+last_modified: 2026-06-12
 ---
 
 # BOM Table
@@ -70,9 +70,9 @@ last_modified: 2026-05-22
 ## Design Decisions
 
 ### D1: MVP 採極簡範圍
-- **Decision**: 第一版只做 Top-Level Only + SW 內建範本 + X/Y 座標，不支援 Parts Only / Indented / 自訂範本 / AnchorType
-- **Rationale**: 與 `insert_detail_view` 只做 circle 的 YAGNI 策略一致；BomType 與 TableTemplate 在 pywin32 late-binding 下踩坑風險高，先用最小可行集合驗證 API 通路
-- **Date**: 2026-05-22
+- **Decision**: 第一版只做 Top-Level Only + SW 內建範本 + X/Y 座標，不支援 Parts Only / Indented / 自訂範本 / AnchorType。實作對兩版 API 的 AnchorType 參數固定傳 0（無 anchor，以 X/Y 座標放置）。
+- **Rationale**: 與 `insert_detail_view` 只做 circle 的 YAGNI 策略一致；BomType 與 TableTemplate 在 pywin32 late-binding 下踩坑風險高，先用最小可行集合驗證 API 通路。AnchorType=0 讓放置位置完全由座標決定，與「不支援 AnchorType」的範圍宣告一致。
+- **Date**: 2026-05-22（2026-06-12 補 AnchorType=0 註記，源自 Issue #16 finding 5）
 
 ### D2: 座標單位採 mm
 - **Decision**: tool 介面接受 mm，內部轉 meters 傳給 COM

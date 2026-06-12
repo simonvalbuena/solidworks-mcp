@@ -1363,13 +1363,6 @@ def _auto_add_ref_dims_inner(
         return {"status": "error", "step": step, "error": str(e),
                 "error_type": type(e).__name__}
 
-    return {
-        "status": "done",
-        "views_processed": [v[0] for v in views],
-        "dimensions_added": total_dims,
-        "details": details,
-    }
-
 
 def _add_bbox_dims(
     drawing, view_obj, bounding: dict, outline: list, offset: float,
@@ -2028,10 +2021,12 @@ def _insert_bom_table(
             errors.append(f"InsertBomTable3: {e}")
 
     if bom_table is None:
-        raise SWError(
-            "Failed to insert BOM table (both API versions returned None): "
-            + "; ".join(errors)
-        )
+        msg = "Failed to insert BOM table (both API versions returned None"
+        if errors:
+            msg += "): " + "; ".join(errors)
+        else:
+            msg += ", no exceptions raised)"
+        raise SWError(msg)
 
     table_name = _safe_get(bom_table, "Name") or ""
 
