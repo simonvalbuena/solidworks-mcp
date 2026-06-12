@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640">
+  <!-- 底色 -->
+  <rect width="1280" height="640" fill="#0f172a"/>
+
+  <!-- ===== 頂部技術標籤 ===== -->
+  <g font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="16">
+    <rect x="836" y="108" width="110" height="32" rx="4" fill="#212a37" stroke="#4f5b62" stroke-width="1"/>
+    <text x="891" y="129" text-anchor="middle" fill="#94A3B8">pywin32</text>
+
+    <rect x="958" y="108" width="120" height="32" rx="4" fill="#212a37" stroke="#4f5b62" stroke-width="1"/>
+    <text x="1018" y="129" text-anchor="middle" fill="#94A3B8">MCP HTTP</text>
+
+    <rect x="1090" y="108" width="110" height="32" rx="4" fill="#212a37" stroke="#4f5b62" stroke-width="1"/>
+    <text x="1145" y="129" text-anchor="middle" fill="#94A3B8">SW 2021</text>
+  </g>
+
+  <!-- ===== 標題區 ===== -->
+  <text x="80" y="150" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="60" font-weight="700" fill="#E2E8F0">
+    solidworks-mcp
+  </text>
+  <rect x="80" y="170" width="120" height="4" rx="2" fill="#fb923c"/>
+  <text x="80" y="216" font-family="'Inter', 'Noto Sans TC', system-ui, sans-serif" font-size="26" font-weight="500" fill="#94A3B8">
+    AI 驅動的工程圖自動產出 MCP Server
+  </text>
+  <text x="80" y="252" font-family="'Inter', 'Noto Sans TC', system-ui, sans-serif" font-size="20" fill="#64748B">
+    從 SolidWorks 3D 模型自動產出工程圖草稿
+  </text>
+
+  <!-- ===== 流程節點 ===== -->
+
+  <!-- 節點 1：3D 模型 -->
+  <rect x="90" y="315" width="280" height="170" rx="4" fill="#212a37" stroke="#4f5b62" stroke-width="1"/>
+  <!-- 等角立方體 -->
+  <polygon points="230,332 258,348 230,364 202,348" fill="#0084ff" opacity="0.85"/>
+  <polygon points="258,348 258,378 230,394 230,364" fill="#0084ff" opacity="0.45"/>
+  <polygon points="202,348 230,364 230,394 202,378" fill="#0084ff" opacity="0.65"/>
+  <text x="230" y="438" text-anchor="middle" font-family="'Inter', 'Noto Sans TC', system-ui, sans-serif" font-size="22" font-weight="600" fill="#E2E8F0">3D 模型</text>
+  <text x="230" y="463" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="14" fill="#64748B">.sldprt / .sldasm</text>
+
+  <!-- 箭頭 1 -->
+  <text x="435" y="382" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="14" fill="#94A3B8">COM</text>
+  <line x1="382" y1="400" x2="476" y2="400" stroke="#64748B" stroke-width="2"/>
+  <polygon points="476,392 492,400 476,408" fill="#64748B"/>
+
+  <!-- 節點 2：SolidWorks 引擎 -->
+  <rect x="500" y="315" width="280" height="170" rx="4" fill="#212a37" stroke="#4f5b62" stroke-width="1"/>
+  <!-- 處理晶片 icon -->
+  <rect x="612" y="332" width="56" height="52" rx="3" fill="#152030" stroke="#6b7b86" stroke-width="1"/>
+  <rect x="624" y="344" width="32" height="28" rx="1" fill="none" stroke="#0084ff" stroke-width="1.5"/>
+  <g stroke="#4f5b62" stroke-width="2">
+    <line x1="628" y1="332" x2="628" y2="325"/>
+    <line x1="640" y1="332" x2="640" y2="325"/>
+    <line x1="652" y1="332" x2="652" y2="325"/>
+    <line x1="628" y1="384" x2="628" y2="391"/>
+    <line x1="640" y1="384" x2="640" y2="391"/>
+    <line x1="652" y1="384" x2="652" y2="391"/>
+    <line x1="612" y1="352" x2="605" y2="352"/>
+    <line x1="612" y1="364" x2="605" y2="364"/>
+    <line x1="668" y1="352" x2="675" y2="352"/>
+    <line x1="668" y1="364" x2="675" y2="364"/>
+  </g>
+  <text x="640" y="438" text-anchor="middle" font-family="'Inter', 'Noto Sans TC', system-ui, sans-serif" font-size="22" font-weight="600" fill="#E2E8F0">SolidWorks</text>
+  <text x="640" y="463" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="14" fill="#64748B">2021 · COM API</text>
+
+  <!-- 箭頭 2 -->
+  <text x="845" y="382" text-anchor="middle" font-family="'Inter', 'Noto Sans TC', system-ui, sans-serif" font-size="14" fill="#94A3B8">視圖 + 標註</text>
+  <line x1="792" y1="400" x2="886" y2="400" stroke="#64748B" stroke-width="2"/>
+  <polygon points="886,392 902,400 886,408" fill="#64748B"/>
+
+  <!-- 節點 3：工程圖 -->
+  <rect x="910" y="315" width="280" height="170" rx="4" fill="#212a37" stroke="#4f5b62" stroke-width="1"/>
+  <!-- 工程圖紙 icon -->
+  <rect x="1022" y="326" width="56" height="74" rx="2" fill="#152030" stroke="#6b7b86" stroke-width="1"/>
+  <circle cx="1042" cy="350" r="8" fill="none" stroke="#0084ff" stroke-width="1.5"/>
+  <!-- 尺寸標註線（橘） -->
+  <line x1="1030" y1="372" x2="1068" y2="372" stroke="#fb923c" stroke-width="1.5"/>
+  <line x1="1030" y1="368" x2="1030" y2="376" stroke="#fb923c" stroke-width="1.5"/>
+  <line x1="1068" y1="368" x2="1068" y2="376" stroke="#fb923c" stroke-width="1.5"/>
+  <!-- 標題欄 -->
+  <rect x="1056" y="386" width="20" height="11" rx="1" fill="none" stroke="#4f5b62" stroke-width="1"/>
+  <text x="1050" y="438" text-anchor="middle" font-family="'Inter', 'Noto Sans TC', system-ui, sans-serif" font-size="22" font-weight="600" fill="#E2E8F0">工程圖</text>
+  <text x="1050" y="463" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="14" fill="#64748B">.slddrw / PDF</text>
+
+  <!-- ===== 署名 ===== -->
+  <text x="80" y="600" font-family="'Inter', system-ui, sans-serif" font-size="18" fill="#64748B">
+    @frankchen.tw
+  </text>
+</svg>

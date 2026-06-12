@@ -52,11 +52,11 @@ Claude Code ◄── Streamable HTTP ──► src/server.py (FastMCP)
 
 ## Development Phases
 
-- Phase 1 (current): 9 tools — 檔案操作 + 基本出圖 + 標註 + 輸出
-- Phase 2: 組立件分析 — 配合關係讀取 + 規則引擎自動視圖判斷
-- Phase 3: 進階視圖 — 剖面圖、局部放大、氣球標註、BOM 表
+- Phase 1（完成）: 檔案操作 + 基本出圖 + 標註 + 輸出
+- Phase 2（完成）: 組立件分析 — 配合關係讀取 + 特徵樹
+- Phase 3（完成）: 進階視圖 — 剖面圖、局部放大、自訂視圖、氣球標註、BOM 表
 
-詳見 `docs/phase*.md` 和 `docs/plans/`。
+目前共 21 tools。詳見 `docs/phase*.md` 和 `docs/plans/`。
 
 ## Key Constraints
 

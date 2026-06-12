@@ -1,0 +1,19 @@
+[project]
+name = "solidworks-mcp"
+version = "0.1.0"
+description = "MCP server for SolidWorks 2021 - drive engineering drawing creation from Claude via COM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "haunchen" }]
+keywords = ["mcp", "solidworks", "claude", "com-automation", "cad"]
+dependencies = [
+    "mcp[server]",
+    "pywin32",
+    "Pillow",
+    "python-dotenv",
+]
+
+[project.urls]
+Repository = "https://github.com/haunchen/solidworks-mcp"
+Issues = "https://github.com/haunchen/solidworks-mcp/issues"

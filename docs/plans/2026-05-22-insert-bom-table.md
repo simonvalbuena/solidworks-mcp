@@ -14,7 +14,7 @@ Design: `docs/plans/2026-05-22-insert-bom-table-design.md`
 
 ## 通用慣例（給 implementer）
 
-- 寫測試前先 `cd D:\UserData\Documents\Code\solidworks-mcp`
+- 寫測試前先 `cd <repo>`（repo 根目錄）
 - 跑測試：`.venv/Scripts/pytest tests/test_bom_table.py -v`
 - 每個 task 結束都跑 `.venv/Scripts/pytest tests/test_bom_table.py -v` 確認該 task 加的 test 過、舊 test 不破
 - Commit 訊息格式：`feat(insert_bom_table): <task 主旨>` 或 `test(insert_bom_table): ...`

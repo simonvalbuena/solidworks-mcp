@@ -22,7 +22,7 @@ MCP tool result 有 25K token 上限，ImageContent base64 被當文字 token �
 
 ### 新增設定
 
-- `SW_MCP_SMB_CLIENT_PATH`：client 端 SMB 路徑（如 `U:\Frank\mcp-share`）
+- `SW_MCP_SMB_CLIENT_PATH`：client 端 SMB 路徑（如 `U:\mcp-share`）
 
 ### 預期效果
 
