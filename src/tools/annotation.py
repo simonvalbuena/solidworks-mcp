@@ -28,6 +28,10 @@ SW_FRACTION_DECIMAL = 1
 # swDimensionPrecisionSettings_e
 SW_PRECISION_UNCHANGED = -1
 
+# Slip Robotics patch: keep the drawing document's units (inches) and use 3-place precision.
+import os as _os
+DIM_PRECISION = int(_os.getenv("SW_MCP_DIM_PRECISION", "3"))
+
 # swInsertAnnotation_e 列舉值（bitmask）
 SW_INSERT_DIMENSIONS = 8                          # 0x8
 SW_INSERT_DIMS_MARKED_FOR_DRAWING = 32768          # 0x8000
@@ -943,10 +947,10 @@ def _add_linear_dimension(
         # 設定單位 mm / 2 位小數
         try:
             disp_dim.SetUnits2(
-                False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+                True, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
             )
             disp_dim.SetPrecision3(
-                2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+                DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED,
             )
         except Exception:
             pass
@@ -1068,10 +1072,10 @@ def _add_radial_dimension(
 
         try:
             disp_dim.SetUnits2(
-                False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+                True, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
             )
             disp_dim.SetPrecision3(
-                2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+                DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED,
             )
         except Exception:
             pass
@@ -1198,7 +1202,7 @@ def _add_angle_dimension(
                 False, SW_ANGLE_DEGREES, SW_FRACTION_DECIMAL, 0, False, 0,
             )
             disp_dim.SetPrecision3(
-                2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+                DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED,
             )
         except Exception:
             pass
@@ -1449,11 +1453,11 @@ def _add_bbox_dims(
             try:
                 # SetUnits2(UseDoc, UType, FractBase, FractDenom, RoundToFrac, DecRound)
                 disp_dim.SetUnits2(
-                    False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+                    True, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
                 )
                 # SetPrecision3(Primary, Dual, PrimaryTol, DualTol)
                 disp_dim.SetPrecision3(
-                    2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+                    DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED,
                 )
             except Exception as e:
                 diag["unit_warning"] = f"設定單位/精度失敗: {e}"
@@ -1595,10 +1599,10 @@ def _add_circle_dims(
         if disp_dim is not None:
             try:
                 disp_dim.SetUnits2(
-                    False, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
+                    True, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0,
                 )
                 disp_dim.SetPrecision3(
-                    2, SW_PRECISION_UNCHANGED, 2, SW_PRECISION_UNCHANGED,
+                    DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED,
                 )
             except Exception as e:
                 diag["unit_warning"] = f"設定單位/精度失敗: {e}"
