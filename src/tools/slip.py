@@ -129,19 +129,60 @@ def _active_drawing():
         raise SWError("no active document")
     if _com_get(doc, "GetType") != 3:
         raise SWError("active document is not a drawing")
+    errors = []
     try:
         import win32com.client  # noqa: WPS433
         try:
             return win32com.client.CastTo(doc, "IDrawingDoc")
         except Exception as e:  # noqa: BLE001
-            logger.debug("CastTo IDrawingDoc failed: %s", e)
+            errors.append(f"CastTo: {e}")
+        # QueryInterface for IDrawingDoc by IID from the SolidWorks type library,
+        # then late-bind on THAT interface pointer so GetIDsOfNames resolves its members.
         try:
-            return win32com.client.dynamic.Dispatch(doc._oleobj_)
+            iid = _iid_from_typelib("IDrawingDoc")
+            ptr = doc._oleobj_.QueryInterface(iid)
+            return win32com.client.Dispatch(ptr)
         except Exception as e:  # noqa: BLE001
-            logger.debug("dynamic Dispatch failed: %s", e)
+            errors.append(f"QI IDrawingDoc: {e}")
     except Exception as e:  # noqa: BLE001
-        logger.debug("win32com unavailable: %s", e)
+        errors.append(f"win32com: {e}")
+    logger.warning("IDrawingDoc cast unavailable (%s); using IModelDoc2 object", "; ".join(errors))
     return doc
+
+
+_IID_CACHE: dict[str, object] = {}
+
+
+def _iid_from_typelib(interface_name: str):
+    """Look up an interface IID in sldworks.tlb (SolidWorks install dir)."""
+    if interface_name in _IID_CACHE:
+        return _IID_CACHE[interface_name]
+    import glob  # noqa: WPS433
+    import os  # noqa: WPS433
+    import pythoncom  # noqa: WPS433
+
+    candidates = glob.glob(r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS*\sldworks.tlb")
+    app = SWConnection.get_instance().get_app()
+    try:
+        exe_dir = os.path.dirname(str(_com_get(app, "GetExecutablePath")))
+        candidates.insert(0, os.path.join(exe_dir, "sldworks.tlb"))
+    except Exception:  # noqa: BLE001
+        pass
+    last = None
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            tlb = pythoncom.LoadTypeLib(path)
+            for i in range(tlb.GetTypeInfoCount()):
+                name = tlb.GetDocumentation(i)[0]
+                if name == interface_name:
+                    iid = tlb.GetTypeInfo(i).GetTypeAttr().iid
+                    _IID_CACHE[interface_name] = iid
+                    return iid
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise SWError(f"{interface_name} not found in sldworks.tlb ({candidates}): {last}")
 
 
 def _call_first(obj, names: list[str], *args):
