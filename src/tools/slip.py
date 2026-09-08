@@ -32,11 +32,13 @@ DISPLAY_MODES = {
     "hidden_lines_removed": 6,
 }
 
-# swTangentEdgeDisplay_e
+# IView.SetDisplayTangentEdges2 values — verified empirically on SolidWorks 2025 by
+# exporting PDFs after each setting (108664 plate, 2026-09-08):
+#   0 -> tangent edges REMOVED, 1 -> visible WITH FONT (phantom), 2 -> VISIBLE (solid).
 TANGENT_EDGES = {
-    "visible": 0,
+    "removed": 0,
     "fonted": 1,
-    "removed": 2,
+    "visible": 2,
 }
 
 
