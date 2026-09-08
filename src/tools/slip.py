@@ -116,12 +116,31 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
 # --------------------------------------------------------------------------- helpers
 
 def _active_drawing():
+    """Active document as an IDrawingDoc-capable COM object.
+
+    Under early binding ActiveDoc is typed IModelDoc2, so IDrawingDoc members
+    (GetSheetNames, GetCurrentSheet, ActivateSheet, GetViews...) are 'Member not
+    found'. Cast to IDrawingDoc; fall back to a late-bound dynamic dispatch which
+    resolves them at call time.
+    """
     app = SWConnection.get_instance().get_app()
     doc = app.ActiveDoc
     if doc is None:
         raise SWError("no active document")
     if _com_get(doc, "GetType") != 3:
         raise SWError("active document is not a drawing")
+    try:
+        import win32com.client  # noqa: WPS433
+        try:
+            return win32com.client.CastTo(doc, "IDrawingDoc")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("CastTo IDrawingDoc failed: %s", e)
+        try:
+            return win32com.client.dynamic.Dispatch(doc._oleobj_)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("dynamic Dispatch failed: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("win32com unavailable: %s", e)
     return doc
 
 
@@ -152,16 +171,51 @@ def _current_sheet_name(drawing) -> str:
 
 
 def _sheet_view(drawing):
-    """The sheet's own IView (parent of all drawing views); it owns sheet-level notes."""
-    for name in ("GetFirstView", "IGetFirstView"):
-        try:
-            v = getattr(drawing, name)
-            v = v() if callable(v) else v
-            if v is not None:
-                return v
-        except Exception as e:  # noqa: BLE001
-            logger.debug("%s failed: %s", name, e)
-    raise SWError("cannot access the sheet view (GetFirstView)")
+    """The sheet's own IView (parent of all drawing views); it owns sheet-level notes.
+
+    Strategies, in order:
+    1. IDrawingDoc.GetViews — array per sheet whose FIRST element is the sheet view.
+    2. GetFirstView / IGetFirstView on the (early-bound) drawing.
+    3. GetFirstView on a late-bound Dispatch wrapper of the same object.
+    """
+    errors = []
+    # 1. GetViews: [[sheetView, view1, ...], [sheetView2, ...]]
+    try:
+        current = _current_sheet_name(drawing)
+        all_views = _com_get(drawing, "GetViews")
+        for per_sheet in _extract_notes(all_views):
+            items = _extract_notes(per_sheet)
+            if not items:
+                continue
+            sheet_view = items[0]
+            try:
+                if str(_com_get(sheet_view, "Name")) == current or len(_extract_notes(all_views)) == 1:
+                    return sheet_view
+            except Exception:  # noqa: BLE001
+                return sheet_view
+        if all_views:
+            first = _extract_notes(all_views)
+            if first and _extract_notes(first[0]):
+                return _extract_notes(first[0])[0]
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"GetViews: {e}")
+    # 2./3. GetFirstView variants
+    candidates = [drawing]
+    try:
+        import win32com.client  # noqa: WPS433
+        candidates.append(win32com.client.Dispatch(drawing))
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Dispatch: {e}")
+    for obj in candidates:
+        for name in ("GetFirstView", "IGetFirstView"):
+            try:
+                v = getattr(obj, name)
+                v = v() if callable(v) else v
+                if v is not None:
+                    return v
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}: {e}")
+    raise SWError("cannot access the sheet view; tried " + "; ".join(errors))
 
 
 def _notes_on_sheet(drawing) -> list:
