@@ -636,41 +636,57 @@ def _add_dimension_to_intersection(view_name, e_line1, e_line2, e_ref, text, ref
     ext = drawing.Extension
     drawing.ClearSelection2(True)
 
-    # 1) reference edge — macro used SelectByRay on the edge; SelectByID2 "EDGE" at the sheet
-    #    midpoint is the closest scriptable equivalent; fall back to IView.SelectEntity.
-    ok1, how1 = False, "none"
-    if ref_mid_sheet is not None:
-        log("sharp: SelectByID2 EDGE at sheet %s", ref_mid_sheet)
-        try:
-            ok1 = bool(ext.SelectByID2("", "EDGE", ref_mid_sheet[0] / _M_TO_MM, ref_mid_sheet[1] / _M_TO_MM,
-                                       0.0, False, 0, None, 0))
-            how1 = "SelectByID2(EDGE)"
-        except Exception as ex:  # noqa: BLE001
-            log("sharp: SelectByID2 EDGE raised %s", ex)
-    if not ok1:
-        log("sharp: IView.SelectEntity(edge, False)")
-        ok1 = bool(view_obj.SelectEntity(edges[int(e_ref)], False))
-        how1 = "SelectEntity"
-    log("sharp: edge selected=%s via %s", ok1, how1)
-
-    # 2) the sketch point — exactly like the macro: SelectByID2("Point<ID>", "SKETCHPOINT", x, y, 0, True, 0, Nothing, 0)
+    # 1) the sketch point FIRST — SelectByID2 with Callout=None raises "Type mismatch" (arg 8) under
+    #    late binding, so try a VT_DISPATCH-null VARIANT, then the old IModelDoc2.SelectByID
+    #    (5 args, no append flag — hence the point goes first and the edge is appended after).
+    import pythoncom
+    from win32com.client import VARIANT
+    null_disp = VARIANT(pythoncom.VT_DISPATCH, None)
     ok2, how = False, "none"
     for nm in names + [""]:
-        log("sharp: SelectByID2 SKETCHPOINT name=%r at %s", nm, ip)
+        log("sharp: SelectByID2(VARIANT null callout) SKETCHPOINT name=%r at %s", nm, ip)
         try:
-            if bool(ext.SelectByID2(nm, "SKETCHPOINT", ip[0], ip[1], 0.0, True, 0, None, 0)):
+            if bool(ext.SelectByID2(nm, "SKETCHPOINT", ip[0], ip[1], 0.0, False, 0, null_disp, 0)):
                 ok2, how = True, f"SelectByID2({nm!r})"
                 break
         except Exception as ex:  # noqa: BLE001
             log("sharp: SelectByID2 %r raised %s", nm, ex)
+        log("sharp: SelectByID SKETCHPOINT name=%r at %s", nm, ip)
+        try:
+            if bool(drawing.SelectByID(nm, "SKETCHPOINT", ip[0], ip[1], 0.0)):
+                ok2, how = True, f"SelectByID({nm!r})"
+                break
+        except Exception as ex:  # noqa: BLE001
+            log("sharp: SelectByID %r raised %s", nm, ex)
     log("sharp: point selected=%s via %s", ok2, how)
+
+    # 2) reference edge, APPENDED to the selection
+    ok1, how1 = False, "none"
+    if ok2:
+        log("sharp: IView.SelectEntity(edge, True)")
+        ok1 = bool(view_obj.SelectEntity(edges[int(e_ref)], True))
+        how1 = "SelectEntity(append)"
+        log("sharp: edge selected=%s via %s", ok1, how1)
+        try:
+            n_sel = int(slip._inv(drawing.SelectionManager, "GetSelectedObjectCount2", -1))
+        except Exception:  # noqa: BLE001
+            try:
+                n_sel = int(drawing.SelectionManager.GetSelectedObjectCount2(-1))
+            except Exception:  # noqa: BLE001
+                n_sel = -1
+        log("sharp: selection count=%s (need 2)", n_sel)
+        if n_sel != -1 and n_sel < 2:
+            ok1 = False
     if not ok1 or not ok2:
         removed = False
         try:
             drawing.ClearSelection2(True)
-            log("sharp: EditUndo2(1) to remove the point")
-            removed = bool(drawing.EditUndo2(1))
-        except Exception:  # noqa: BLE001
+            log("sharp: removing the point (Select2 + EditDelete, as delete_view_sketch_points)")
+            if bool(pt.Select2(False, 0)):
+                drawing.EditDelete()
+                removed = True
+        except Exception as ex:  # noqa: BLE001
+            log("sharp: point removal raised %s", ex)
             removed = False
         raise SWError(f"selection failed (edge {ok1} via {how1}, sketch point {ok2} via {how}) - "
                       f"point at {ip} {'removed by undo' if removed else 'LEFT IN VIEW (run delete_view_sketch_points)'}")
