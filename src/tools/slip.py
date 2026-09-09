@@ -93,6 +93,13 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         return await _run(sw, "move_dimension_text", _move_dimension_text, dimension_name, x_mm, y_mm)
 
     @mcp.tool()
+    async def set_dimension_reference(dimension_name: str, reference: bool = True) -> str:
+        """Show a display dimension in parentheses as a REFERENCE dimension (reference=True),
+        e.g. sheet-metal thickness (.120); reference=False removes the parentheses.
+        dimension_name as returned by list_dimensions, e.g. 'RD1@Drawing View2@108543.Drawing'."""
+        return await _run(sw, "set_dimension_reference", _set_dimension_reference, dimension_name, reference)
+
+    @mcp.tool()
     async def delete_view(view_name: str) -> str:
         """Delete a drawing view (and its dimensions) by name, e.g. 'Drawing View2'."""
         return await _run(sw, "delete_view", _delete_view, view_name)
@@ -127,6 +134,13 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         """Find/replace inside a sheet note's property-linked text (keeps property links intact).
         Use replace="" to delete a fragment or a whole line."""
         return await _run(sw, "replace_in_note", _replace_in_note, note_name, find, replace)
+
+    @mcp.tool()
+    async def remove_note_paragraph(note_name: str, contains: str) -> str:
+        """Remove one whole numbered paragraph from a notes-block note (e.g. the template's
+        'MASK AREAS SHOWN FROM FINISH.' or the rev-flag note) together with its blank spacer
+        paragraph; remaining notes re-number. `contains` must match exactly one paragraph."""
+        return await _run(sw, "remove_note_paragraph", _remove_note_paragraph, note_name, contains)
 
     @mcp.tool()
     async def delete_note(note_name: str) -> str:
@@ -352,6 +366,31 @@ def _move_dimension_text(dimension_name: str, x_mm: float, y_mm: float) -> dict:
     raise SWError(f"dimension {dimension_name!r} not found")
 
 
+def _find_display_dim(drawing, dimension_name: str):
+    for _name, view in _get_drawing_views(drawing, None):
+        for dd in _iter_display_dims(view):
+            if _dim_info(dd).get("name") == dimension_name:
+                return dd
+    raise SWError(f"dimension {dimension_name!r} not found")
+
+
+def _set_dimension_reference(dimension_name: str, reference: bool) -> dict:
+    """Show/hide parentheses on a display dimension (IDisplayDimension.ShowParenthesis)."""
+    drawing = _active_drawing()
+    dd = _find_display_dim(drawing, dimension_name)
+    try:
+        before = bool(_inv(dd, "ShowParenthesis"))
+    except Exception:  # noqa: BLE001
+        before = None
+    _put(dd, "ShowParenthesis", bool(reference))
+    _rebuild(drawing)
+    after = bool(_inv(dd, "ShowParenthesis"))
+    if after != bool(reference):
+        raise SWError(f"ShowParenthesis still {after} after set on {dimension_name!r}")
+    return {"status": "done", "dimension": dimension_name, "parenthesis_before": before,
+            "parenthesis_after": after, "dimension_info": _dim_info(dd)}
+
+
 # --------------------------------------------------------------------------- sheets
 
 def _sheet_names(drawing) -> list[str]:
@@ -469,17 +508,57 @@ def _set_note_text(note_name: str, text: str, linked: bool) -> dict:
     return {"status": "done", "note": note_name, "before": before, "after": _note_info(note)}
 
 
+def _normalize_newlines(s: str) -> str:
+    """MCP clients cannot type a carriage return: accept literal '\\r\\n' / '\\n' escape
+    sequences and bare LF, and turn them all into the CRLF SolidWorks uses in note text."""
+    s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
+    return s.replace("\n", "\r\n")
+
+
 def _replace_in_note(note_name: str, find: str, replace: str) -> dict:
     drawing = _active_drawing()
     note = _find_note(drawing, note_name)
     before = _note_info(note)
     src = before.get("linked_text") or before.get("text") or ""
+    find = _normalize_newlines(find)
+    replace = _normalize_newlines(replace)
     if find not in src:
         raise SWError(f"fragment not found in note {note_name!r}: {find!r}")
     _put(note, "PropertyLinkedText", src.replace(find, replace))
     _rebuild(drawing)
     return {"status": "done", "note": note_name, "occurrences": src.count(find),
             "before": before, "after": _note_info(note)}
+
+
+def _is_blank_para(line: str) -> bool:
+    return line.startswith("<PARA") and "number=off" in line and line.rstrip().endswith(">")
+
+
+def _remove_note_paragraph(note_name: str, contains: str) -> dict:
+    """Remove the whole numbered paragraph whose text contains `contains`, plus the blank
+    spacer paragraph that follows it (or precedes it, for the last paragraph), so the
+    remaining notes re-number and keep their spacing."""
+    drawing = _active_drawing()
+    note = _find_note(drawing, note_name)
+    before = _note_info(note)
+    src = before.get("linked_text") or before.get("text") or ""
+    lines = src.split("\r\n")
+    hits = [i for i, ln in enumerate(lines) if contains in ln]
+    if not hits:
+        raise SWError(f"no paragraph containing {contains!r} in note {note_name!r}")
+    if len(hits) > 1:
+        raise SWError(f"{contains!r} matches {len(hits)} paragraphs in {note_name!r}; be more specific")
+    i = hits[0]
+    removed = [lines[i]]
+    del lines[i]
+    if i < len(lines) and _is_blank_para(lines[i]):
+        removed.append(lines.pop(i))
+    elif i > 0 and _is_blank_para(lines[i - 1]):
+        removed.append(lines.pop(i - 1))
+    _put(note, "PropertyLinkedText", "\r\n".join(lines))
+    _rebuild(drawing)
+    return {"status": "done", "note": note_name, "removed_lines": removed,
+            "before_text": before.get("text"), "after": _note_info(note)}
 
 
 def _delete_note(note_name: str) -> dict:

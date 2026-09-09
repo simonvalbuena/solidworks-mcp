@@ -1,0 +1,12 @@
+[
+  {
+    "note": "DetailItem1814",
+    "find": "<PARA  indent=10 findent=0 indentStep=10 number=on ntype=1 nformat=$$. nstartNum=0 numOrder=0 bordertype=2 paraSpace=0.001 lineSpace=0.001 flagNote=false flagNoteId=-1 DNSPeriodState=0>MASK AREAS SHOWN FROM FINISH.\r\n<PARA  indent=0 findent=0 indentStep=10 number=off bullet=off paraSpace=0.001 lineSpace=0.001 flagNote=false flagNoteId=-1 DNSPeriodState=0>\r\n",
+    "replace": ""
+  },
+  {
+    "note": "DetailItem1814",
+    "find": "\r\n<PARA  indent=0 findent=0 indentStep=10 number=off bullet=off paraSpace=0.001 lineSpace=0.001 flagNote=false flagNoteId=-1 DNSPeriodState=0>\r\n<PARA  indent=10 findent=0 indentStep=10 number=on ntype=1 nformat=$$. nstartNum=0 numOrder=0 bordertype=3 paraSpace=0.001 lineSpace=0.001 flagNote=false flagNoteId=-1 DNSPeriodState=0><FONT size=4.064>WHERE SHOWN \"<FONT size=16PTS><border type=3 size=0  padding=0>8</border><FONT size=4.064>\" DENOTED LOCATIONS WHERE MODIFICATION HAVE TAKEN PLACE UNDER LATEST RELEASED REVISION NUMBER <FONT style=B>$PRPSHEET:\"REVISION\"<FONT style=RB>.",
+    "replace": ""
+  }
+]
