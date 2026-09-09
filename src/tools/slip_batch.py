@@ -199,10 +199,57 @@ def _edge_points_m(edge) -> tuple:
     return start, end, center, radius
 
 
+def _read_edge_once(edge, index: int) -> dict:
+    """ONE COM pass per edge (type + vertices + circle params). Dense tube views have
+    200-300 visible edges, so every extra COM round-trip per edge costs seconds."""
+    rec: dict = {"index": index, "type": "other", "_cached": True}
+    curve = None
+    try:
+        curve = edge.GetCurve
+    except Exception:  # noqa: BLE001
+        pass
+    for attr, key in (("GetStartVertex", "start"), ("GetEndVertex", "end")):
+        try:
+            v = getattr(edge, attr)
+            if v is not None:
+                p = v.GetPoint
+                rec[key] = (float(p[0]), float(p[1]), float(p[2]))
+        except Exception:  # noqa: BLE001
+            pass
+    if curve is not None:
+        try:
+            if curve.IsLine:
+                rec["type"] = "line"
+            elif curve.IsCircle:
+                rec["type"] = "circle" if "start" not in rec else "arc"
+                cp = curve.CircleParams
+                rec["center"] = (float(cp[0]), float(cp[1]), float(cp[2]))
+                rec["radius"] = float(cp[6])
+        except Exception:  # noqa: BLE001
+            pass
+    s, e, c = rec.get("start"), rec.get("end"), rec.get("center")
+    if s and e:
+        rec["midpoint"] = {"x": round((s[0] + e[0]) / 2 * _M_TO_MM, 4),
+                           "y": round((s[1] + e[1]) / 2 * _M_TO_MM, 4)}
+    elif c:
+        rec["midpoint"] = {"x": round(c[0] * _M_TO_MM, 4), "y": round(c[1] * _M_TO_MM, 4)}
+    return rec
+
+
+def _read_edges_once(edges) -> list[dict]:
+    return [_read_edge_once(edge, i) for i, edge in enumerate(edges)]
+
+
 def _apply_transform(to_sheet, edges, edges_info) -> list[dict]:
+    """edges_info entries may carry cached model points (from _read_edges_once); only when
+    they don't is the edge queried over COM."""
     out = []
     for info, edge in zip(edges_info, edges):
-        start, end, center, radius = _edge_points_m(edge)
+        if info.get("_cached"):
+            start, end, center, radius = (info.get("start"), info.get("end"),
+                                          info.get("center"), info.get("radius"))
+        else:
+            start, end, center, radius = _edge_points_m(edge)
         rec = {"i": info["index"], "t": info["type"]}
         if to_sheet is not None:
             try:
@@ -344,7 +391,7 @@ def _view_geometry(view_name, include_edges: bool) -> dict:
         except Exception:  # noqa: BLE001
             pass
         edges = _get_view_edges(view_obj)
-        edges_info = _build_edges_info(edges)
+        edges_info = _read_edges_once(edges)   # single COM pass; transforms reuse the cache
         sheet_edges = _sheet_edges(app, view_obj, edges, edges_info)
         scale = _view_scale(view_obj)
         summ = _summarize(sheet_edges)
@@ -379,7 +426,13 @@ def _add_dimensions(view_name: str, dims: list[dict]) -> dict:
     edges = _get_view_edges(view_obj)
     if not edges:
         raise SWError(f"view {vname} has no visible edges")
-    edges_info = _build_edges_info(edges)
+    # Type-check only the edges we are about to use (dense views: 200+ edges, full probe = 20 s+)
+    _type_cache: dict[int, str] = {}
+
+    def _edge_type(i: int) -> str:
+        if i not in _type_cache:
+            _type_cache[i] = _read_edge_once(edges[i], i)["type"]
+        return _type_cache[i]
 
     orig_pref = None
     try:
@@ -403,8 +456,8 @@ def _add_dimensions(view_name: str, dims: list[dict]) -> dict:
                 continue
             if kind in ("diameter", "radius"):
                 need = "circle" if kind == "diameter" else "arc"
-                if edges_info[e1]["type"] != need:
-                    results.append({"n": n, "error": f"{kind} needs a {need} edge; e1 {e1} is {edges_info[e1]['type']}"})
+                if _edge_type(e1) != need:
+                    results.append({"n": n, "error": f"{kind} needs a {need} edge; e1 {e1} is {_edge_type(e1)}"})
                     continue
             if not text or len(text) != 2:
                 results.append({"n": n, "error": "text [x_mm, y_mm] is required"})

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from concurrent.futures import Future
 from typing import Any, Callable
@@ -19,7 +20,7 @@ from errors import SWConnectionError, SWNotRunningError, SWTimeoutError
 
 logger = logging.getLogger(__name__)
 
-COM_TIMEOUT = 30
+COM_TIMEOUT = int(os.environ.get("SW_COM_TIMEOUT", "90"))  # dense tube views need > 30 s
 
 _SHUTDOWN = object()
 
