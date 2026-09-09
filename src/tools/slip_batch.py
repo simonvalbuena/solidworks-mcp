@@ -591,9 +591,29 @@ def _add_dimension_to_intersection(view_name, e_line1, e_line2, e_ref, text, ref
     arr = _get_xform_array(view_obj)
     a1, a2 = _view_space_xy(arr, l1["start"]), _view_space_xy(arr, l1["end"])
     b1, b2 = _view_space_xy(arr, l2["start"]), _view_space_xy(arr, l2["end"])
-    ip = _line_intersection(a1, a2, b1, b2)
-    if ip is None:
+    ip_rot = _line_intersection(a1, a2, b1, b2)
+    if ip_rot is None:
         raise SWError("the two edges are parallel in this view - no intersection")
+    # The drawing view's SKETCH space is centred on IView.Position (unscaled sheet offsets):
+    #   sketch = (sheet_unbroken - Position) / scale,  sheet_unbroken = scale*(p.R) + t
+    # (2026-09-09: using the rotated model point alone put the point 4 in off on 108544 - the
+    # transform translation t is not the view centre.)
+    t = arr[9:12]
+    sc = arr[12] if arr[12] else 1.0
+    try:
+        pos = view_obj.Position
+        cx, cy = float(pos[0]), float(pos[1])
+    except Exception as ex:  # noqa: BLE001
+        raise SWError(f"IView.Position unavailable: {ex}")
+    try:
+        vs = float(view_obj.ScaleDecimal) or sc
+    except Exception:  # noqa: BLE001
+        vs = sc
+    sheet_x = sc * ip_rot[0] + t[0]
+    sheet_y = sc * ip_rot[1] + t[1]
+    ip = ((sheet_x - cx) / vs, (sheet_y - cy) / vs)
+    logger.info("sharp: rotated=%s sheet_unbroken_m=(%s,%s) position=(%s,%s) scale=%s -> sketch=%s",
+                ip_rot, sheet_x, sheet_y, cx, cy, vs, ip)
 
     # sketch point at the virtual sharp, in the view's sketch (what Find Intersection creates).
     # 2026-09-09: the first version toggled SketchManager.AddToDB and selected the point with
