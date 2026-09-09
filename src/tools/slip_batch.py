@@ -111,24 +111,63 @@ def _view_scale(view_obj) -> float | None:
     return None
 
 
-def _model_to_sheet_fn(app, view_obj):
-    """Return f(x_m, y_m, z_m) -> (X_mm, Y_mm) in sheet space, or None if unavailable."""
-    try:
-        xform = view_obj.ModelToViewTransform
-        mu = app.GetMathUtility
-        if xform is None or mu is None:
-            return None
-    except Exception as e:  # noqa: BLE001
-        logger.debug("ModelToViewTransform unavailable: %s", e)
-        return None
+_TRANSFORM_DEBUG: dict = {}
+
+
+def _get_xform_array(view_obj):
+    """16 doubles of IView.ModelToViewTransform (IMathTransform.ArrayData), or raise."""
+    errors = []
+    xform = None
+    for getter in (lambda: view_obj.ModelToViewTransform,
+                   lambda: slip._inv(view_obj, "ModelToViewTransform")):
+        try:
+            xform = getter()
+            if xform is not None:
+                break
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"xform: {e}")
+    if xform is None:
+        raise SWError("; ".join(errors) or "ModelToViewTransform returned None")
+    for getter in (lambda: xform.ArrayData, lambda: slip._inv(xform, "ArrayData")):
+        try:
+            arr = getter()
+            if arr is not None and len(arr) >= 13:
+                return [float(v) for v in arr]
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"ArrayData: {e}")
+    raise SWError("; ".join(errors) or "ArrayData unavailable")
+
+
+def _make_transform(arr: list[float], row_major: bool):
+    """IMathTransform.ArrayData: [0..8] 3x3 rotation, [9..11] translation, [12] scale.
+    SolidWorks documents the point transform as  p' = scale * (p · R) + t  (row vector);
+    the other convention is tried too and the outline self-check picks the right one."""
+    r = arr[0:9]; t = arr[9:12]; sc = arr[12] if arr[12] else 1.0
 
     def f(x, y, z):
-        pt = mu.CreatePoint((float(x), float(y), float(z)))
-        pt2 = pt.MultiplyTransform(xform)
-        d = pt2.ArrayData
-        return float(d[0]) * _M_TO_MM, float(d[1]) * _M_TO_MM
+        if row_major:   # p · R  (row vector times matrix)
+            X = x * r[0] + y * r[3] + z * r[6]
+            Y = x * r[1] + y * r[4] + z * r[7]
+        else:           # R · p
+            X = x * r[0] + y * r[1] + z * r[2]
+            Y = x * r[3] + y * r[4] + z * r[5]
+        return (sc * X + t[0]) * _M_TO_MM, (sc * Y + t[1]) * _M_TO_MM
 
     return f
+
+
+def _model_to_sheet_fn(app, view_obj):
+    """Return f(x_m, y_m, z_m) -> (X_mm, Y_mm) in sheet space (both matrix conventions are
+    returned as candidates; _sheet_edges picks the one matching GetOutline), or None."""
+    _TRANSFORM_DEBUG.clear()
+    try:
+        arr = _get_xform_array(view_obj)
+    except Exception as e:  # noqa: BLE001
+        _TRANSFORM_DEBUG["error"] = str(e)
+        logger.debug("ModelToViewTransform unavailable: %s", e)
+        return None
+    _TRANSFORM_DEBUG["array"] = [round(v, 6) for v in arr[:13]]
+    return (_make_transform(arr, True), _make_transform(arr, False))
 
 
 def _edge_points_m(edge) -> tuple:
@@ -160,9 +199,7 @@ def _edge_points_m(edge) -> tuple:
     return start, end, center, radius
 
 
-def _sheet_edges(app, view_obj, edges, edges_info) -> list[dict]:
-    """Edge list with sheet-space coordinates; self-calibrated against the view outline."""
-    to_sheet = _model_to_sheet_fn(app, view_obj)
+def _apply_transform(to_sheet, edges, edges_info) -> list[dict]:
     out = []
     for info, edge in zip(edges_info, edges):
         start, end, center, radius = _edge_points_m(edge)
@@ -182,28 +219,59 @@ def _sheet_edges(app, view_obj, edges, edges_info) -> list[dict]:
             rec["len"] = round(math.dist(rec["s"], rec["e"]), 3)
         if radius is not None:
             rec["r"] = round(radius * _M_TO_MM, 3)
-        # keep the model midpoint so the entry can also be passed to add_dimension (probe format)
         mp = info.get("midpoint")
         if mp:
             rec["model_mid"] = [mp["x"], mp["y"]]
         out.append(rec)
+    return out
 
-    # self-calibration: the transformed bbox must coincide with GetOutline (which includes
-    # a small margin) — if the centres differ, shift everything.
+
+def _bbox(recs):
+    pts = [p for r in recs for p in (r.get("s"), r.get("e"), r.get("c")) if p]
+    if not pts:
+        return None
+    return [min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts)]
+
+
+def _sheet_edges(app, view_obj, edges, edges_info) -> list[dict]:
+    """Edge list with sheet-space coordinates; the matrix convention and any residual offset
+    are calibrated against GetOutline (sheet mm, includes a small margin)."""
+    candidates = _model_to_sheet_fn(app, view_obj)
     outline = _outline_mm(view_obj)
-    pts = [p for r in out for p in (r.get("s"), r.get("e"), r.get("c")) if p]
-    if outline and pts:
-        bx = (min(p[0] for p in pts) + max(p[0] for p in pts)) / 2
-        by = (min(p[1] for p in pts) + max(p[1] for p in pts)) / 2
-        ox = (outline[0] + outline[2]) / 2
-        oy = (outline[1] + outline[3]) / 2
-        dx, dy = ox - bx, oy - by
-        if abs(dx) > 1.0 or abs(dy) > 1.0:
-            for r in out:
+    if candidates is None:
+        return _apply_transform(None, edges, edges_info)
+    best, best_err = None, float("inf")
+    for cand in candidates:
+        recs = _apply_transform(cand, edges, edges_info)
+        bb = _bbox(recs)
+        if bb is None:
+            continue
+        if outline:
+            # size error (catches a wrong rotation) + centre error (catches the transposed
+            # convention whenever the model is not centred on its origin)
+            err = (abs((bb[2] - bb[0]) - (outline[2] - outline[0]))
+                   + abs((bb[3] - bb[1]) - (outline[3] - outline[1]))
+                   + abs((bb[0] + bb[2]) / 2 - (outline[0] + outline[2]) / 2)
+                   + abs((bb[1] + bb[3]) / 2 - (outline[1] + outline[3]) / 2))
+        else:
+            err = 0.0
+        if err < best_err:
+            best, best_err = recs, err
+            _TRANSFORM_DEBUG["convention"] = "row_vector(p*R)" if cand is candidates[0] else "column(R*p)"
+    if best is None:
+        return _apply_transform(None, edges, edges_info)
+    _TRANSFORM_DEBUG["fit_error_mm"] = round(best_err, 2)
+    bb = _bbox(best)
+    if outline and bb:
+        dx = (outline[0] + outline[2]) / 2 - (bb[0] + bb[2]) / 2
+        dy = (outline[1] + outline[3]) / 2 - (bb[1] + bb[3]) / 2
+        _TRANSFORM_DEBUG["offset_applied_mm"] = [round(dx, 2), round(dy, 2)]
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            for r in best:
                 for k in ("s", "e", "c", "m"):
                     if k in r:
                         r[k] = [round(r[k][0] + dx, 2), round(r[k][1] + dy, 2)]
-    return out
+    return best
 
 
 def _summarize(edges: list[dict]) -> dict:
@@ -290,6 +358,7 @@ def _view_geometry(view_name, include_edges: bool) -> dict:
         entry = {"view": vname, "outline_mm": _outline_mm(view_obj), "scale": scale,
                  "edge_count": len(sheet_edges),
                  "sheet_coords": "ok" if any("s" in r or "c" in r for r in sheet_edges) else "UNAVAILABLE (ModelToViewTransform failed — fall back to probe_drawing_edges)",
+                 "transform_debug": dict(_TRANSFORM_DEBUG),
                  "summary": summ}
         if include_edges:
             entry["edges"] = sheet_edges
