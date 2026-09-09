@@ -72,6 +72,31 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         return await slip._run(sw, "add_dimensions", _add_dimensions, view_name, dims)
 
     @mcp.tool()
+    async def add_dimension_to_intersection(
+        view_name: str,
+        e_line1: int,
+        e_line2: int,
+        e_ref: int,
+        text: list[float],
+        reference: bool = False,
+    ) -> str:
+        """Slip rule for edges that end in a radius (chamfers/end cuts meeting a relief fillet,
+        non-90 deg flanges): dimension to the VIRTUAL SHARP, never to the arc. This is SolidWorks'
+        Smart Dimension -> "Find Intersection": it puts a sketch point at the theoretical
+        intersection of two straight edges in the view's sketch and dimensions from e_ref to it.
+        e_line1/e_line2: indices (view_geometry) of the two straight edges whose extensions meet;
+        e_ref: the edge the dimension is measured from (e.g. the bottom edge); text: [x_mm, y_mm]
+        ACTUAL sheet position. Returns the sharp's view coordinates, the dimension name and value."""
+        return await slip._run(sw, "add_dimension_to_intersection", _add_dimension_to_intersection,
+                               view_name, e_line1, e_line2, e_ref, text, reference)
+
+    @mcp.tool()
+    async def delete_view_sketch_points(view_name: str) -> str:
+        """Delete stray sketch points left in a drawing view's sketch (e.g. by a failed
+        add_dimension_to_intersection). Returns how many points were found/deleted."""
+        return await slip._run(sw, "delete_view_sketch_points", _delete_view_sketch_points, view_name)
+
+    @mcp.tool()
     async def finish_slip_r00(
         iso_view: str | None = "Drawing View3",
         finish_text: str | None = None,
@@ -401,8 +426,34 @@ def _view_geometry(view_name, include_edges: bool) -> dict:
             if "height_sheet_mm" in summ:
                 summ["height_in"] = round(summ["height_sheet_mm"] / scale / _IN, 4)
             for g in summ.get("circles", []):
-                g["dia_in"] = round(2 * g["r_sheet_mm"] / scale / _IN, 4)
+                # radii come from CircleParams = MODEL mm (scale-independent)
+                g["r_model_mm"] = g.pop("r_sheet_mm")
+                g["dia_in"] = round(2 * g["r_model_mm"] / _IN, 4)
+        # Broken views: SolidWorks reports geometry in UNBROKEN space. Record the shift so
+        # add_dimensions / move_dimension_text can take ACTUAL sheet coordinates, and expose
+        # actual coordinates on the summary/edges ("*_actual").
+        bbox = summ.get("bbox_mm")
+        binfo = slip._record_break_shift(vname, view_obj, bbox)
+        if binfo.get("broken"):
+            def _act(pt):
+                return [round(v, 2) for v in slip._to_actual(vname, pt[0], pt[1])]
+            for r in sheet_edges:
+                for k in ("s", "e", "c", "m"):
+                    if k in r:
+                        r[k + "_actual"] = _act(r[k])
+            for side in summ.get("envelope_edges", {}).values():
+                if side and side.get("m"):
+                    side["m_actual"] = _act(side["m"])
+            for g in summ.get("circles", []):
+                g["top_left"]["c_actual"] = _act(g["top_left"]["c"])
+                for c in g.get("all", []):
+                    c["c_actual"] = _act(c["c"])
         entry = {"view": vname, "outline_mm": _outline_mm(view_obj), "scale": scale,
+                 "break": binfo,
+                 "coords_note": ("BROKEN VIEW: s/e/c/m are unbroken-space; *_actual are what is on the sheet "
+                                 "(+/-2 mm). Pass ACTUAL sheet mm to add_dimensions (converted to the unbroken "
+                                 "point AddDimension wants) and to move_dimension_text (no conversion needed)."
+                                 if binfo.get("broken") else "sheet mm"),
                  "edge_count": len(sheet_edges),
                  "sheet_coords": "ok" if any("s" in r or "c" in r for r in sheet_edges) else "UNAVAILABLE (ModelToViewTransform failed — fall back to probe_drawing_edges)",
                  "transform_debug": dict(_TRANSFORM_DEBUG),
@@ -411,6 +462,270 @@ def _view_geometry(view_name, include_edges: bool) -> dict:
             entry["edges"] = sheet_edges
         result.append(entry)
     return {"status": "done", "views": result}
+
+
+# --------------------------------------------------------------------------- virtual sharp
+
+def _view_space_xy(arr, p):
+    """Model point (m) -> drawing-view SKETCH space (m): rotation only (row-vector p.R), no
+    scale, no translation. Verified against a recorded macro on 108538: the virtual-sharp
+    sketch point at the +Z end of the Right view was selected at (2.600325, -0.0202406) =
+    (-z, y) in metres."""
+    r = arr[0:9]
+    return (p[0] * r[0] + p[1] * r[3] + p[2] * r[6],
+            p[0] * r[1] + p[1] * r[4] + p[2] * r[7])
+
+
+def _line_intersection(a1, a2, b1, b2):
+    """2D intersection of infinite lines a and b (each given by two points); None if parallel."""
+    x1, y1 = a1; x2, y2 = a2; x3, y3 = b1; x4, y4 = b2
+    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(den) < 1e-15:
+        return None
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
+    return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+
+
+def _sketch_point_names(pt) -> list[str]:
+    names = []
+    try:
+        ids = slip._inv(pt, "GetID")
+        if ids is not None:
+            for v in list(ids)[::-1]:
+                names.append(f"Point{int(v)}")
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def _select_sketch_point(drawing, pt, ip) -> tuple:
+    """Select a drawing-view sketch point (append to selection). Tries, in order:
+    SelectByID2 with the point's name (Point<ID>, as the recorded macro), SelectByID2 with an
+    empty name at the point's coordinates, ISketchPoint.Select2, ISketchPoint.Select4 with a real
+    SelectData. Returns (ok, method)."""
+    ext = drawing.Extension
+    for nm in _sketch_point_names(pt) + [""]:
+        try:
+            if bool(ext.SelectByID2(nm, "SKETCHPOINT", ip[0], ip[1], 0.0, True, 0, None, 0)):
+                return True, f"SelectByID2({nm!r})"
+        except Exception as e:  # noqa: BLE001
+            logger.debug("SelectByID2 %r failed: %s", nm, e)
+    try:
+        if bool(pt.Select2(True, 0)):
+            return True, "Select2"
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Select2 failed: %s", e)
+    try:
+        sel_mgr = drawing.SelectionManager
+        sd = sel_mgr.CreateSelectData
+        if bool(pt.Select4(True, sd)):
+            return True, "Select4(SelectData)"
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Select4 failed: %s", e)
+    return False, "none"
+
+
+def _delete_view_sketch_points(view_name) -> dict:
+    """Delete every sketch point in the view's own sketch (stray Find-Intersection points)."""
+    drawing = slip._active_drawing()
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"view not found: {view_name}")
+    vname, view_obj = views[0]
+    drawing.ActivateView(vname)
+    sk = None
+    try:
+        sk = slip._inv(view_obj, "GetSketch")
+    except Exception as e:  # noqa: BLE001
+        raise SWError(f"IView.GetSketch failed: {e}")
+    if sk is None:
+        return {"status": "done", "view": vname, "found": 0, "deleted": 0, "note": "view has no sketch"}
+    try:
+        pts = slip._inv(sk, "GetSketchPoints2") or []
+    except Exception as e:  # noqa: BLE001
+        raise SWError(f"ISketch.GetSketchPoints2 failed: {e}")
+    pts = list(pts)
+    found = len(pts)
+    deleted, methods = 0, []
+    for pt in pts:
+        try:
+            ip = (float(pt.X), float(pt.Y))
+        except Exception:  # noqa: BLE001
+            ip = (0.0, 0.0)
+        drawing.ClearSelection2(True)
+        ok, how = _select_sketch_point(drawing, pt, ip)
+        if not ok:
+            methods.append(f"{ip}: not selectable")
+            continue
+        try:
+            drawing.EditDelete()
+            deleted += 1
+            methods.append(f"{ip}: deleted via {how}")
+        except Exception as e:  # noqa: BLE001
+            methods.append(f"{ip}: EditDelete failed {e}")
+    drawing.ClearSelection2(True)
+    try:
+        drawing.EditRebuild3()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"status": "done", "view": vname, "found": found, "deleted": deleted, "detail": methods}
+
+
+def _add_dimension_to_intersection(view_name, e_line1, e_line2, e_ref, text, reference) -> dict:
+    app = SWConnection.get_instance().get_app()
+    drawing = slip._active_drawing()
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"view not found: {view_name}")
+    vname, view_obj = views[0]
+    drawing.ActivateView(vname)
+    edges = _get_view_edges(view_obj)
+    for i in (e_line1, e_line2, e_ref):
+        if int(i) < 0 or int(i) >= len(edges):
+            raise SWError(f"edge index {i} out of range 0..{len(edges)-1}")
+    l1 = _read_edge_once(edges[int(e_line1)], int(e_line1))
+    l2 = _read_edge_once(edges[int(e_line2)], int(e_line2))
+    for lab, rec in (("e_line1", l1), ("e_line2", l2)):
+        if rec["type"] != "line" or "start" not in rec or "end" not in rec:
+            raise SWError(f"{lab} (index {rec['index']}) is not a straight edge with two vertices ({rec['type']})")
+    arr = _get_xform_array(view_obj)
+    a1, a2 = _view_space_xy(arr, l1["start"]), _view_space_xy(arr, l1["end"])
+    b1, b2 = _view_space_xy(arr, l2["start"]), _view_space_xy(arr, l2["end"])
+    ip = _line_intersection(a1, a2, b1, b2)
+    if ip is None:
+        raise SWError("the two edges are parallel in this view - no intersection")
+
+    # sketch point at the virtual sharp, in the view's sketch (what Find Intersection creates).
+    # 2026-09-09: the first version toggled SketchManager.AddToDB and selected the point with
+    # ISketchPoint.Select4(True, None) -> SolidWorks crashed (RPC failed). Now: plain CreatePoint
+    # and selection exactly like the recorded macro: SelectByID2("", "SKETCHPOINT", x, y, 0, True, ...).
+    # 2026-09-09 (v3 crashed SolidWorks too, after the point was created): v4 mirrors the recorded
+    # macro step by step and logs every step to logs/server.log BEFORE executing it, so a crash
+    # can be attributed. Selection fallbacks that are not in the macro (ISketchPoint.Select2 /
+    # Select4) are no longer attempted here.
+    log = logger.info
+    log("sharp: view=%s ip=%s e_ref=%s", vname, ip, e_ref)
+    ref_mid_sheet = None  # (SelectByID2 "EDGE" needs a sheet point on the edge; SelectEntity is used instead)
+
+    drawing.ClearSelection2(True)
+    skm = drawing.SketchManager
+    log("sharp: CreatePoint")
+    try:
+        pt = skm.CreatePoint(ip[0], ip[1], 0.0)
+    except Exception as e:  # noqa: BLE001
+        raise SWError(f"SketchManager.CreatePoint failed: {e}")
+    if pt is None:
+        raise SWError("SketchManager.CreatePoint returned None (is the view activated?)")
+    names = _sketch_point_names(pt)
+    log("sharp: point created, GetID names=%s", names)
+    # leave any implicit sketch edit the point creation may have started
+    try:
+        active = skm.ActiveSketch
+        log("sharp: ActiveSketch is %s", "set" if active is not None else "None")
+        if active is not None:
+            log("sharp: InsertSketch(True) to exit the sketch")
+            skm.InsertSketch(True)
+    except Exception as ex:  # noqa: BLE001
+        log("sharp: ActiveSketch/InsertSketch raised %s", ex)
+    log("sharp: ActivateView(%s)", vname)
+    drawing.ActivateView(vname)
+
+    ax, ay = float(text[0]), float(text[1])
+    ux, uy = slip._to_unbroken(vname, view_obj, ax, ay)
+    tx, ty = ux / _M_TO_MM, uy / _M_TO_MM
+    ext = drawing.Extension
+    drawing.ClearSelection2(True)
+
+    # 1) reference edge — macro used SelectByRay on the edge; SelectByID2 "EDGE" at the sheet
+    #    midpoint is the closest scriptable equivalent; fall back to IView.SelectEntity.
+    ok1, how1 = False, "none"
+    if ref_mid_sheet is not None:
+        log("sharp: SelectByID2 EDGE at sheet %s", ref_mid_sheet)
+        try:
+            ok1 = bool(ext.SelectByID2("", "EDGE", ref_mid_sheet[0] / _M_TO_MM, ref_mid_sheet[1] / _M_TO_MM,
+                                       0.0, False, 0, None, 0))
+            how1 = "SelectByID2(EDGE)"
+        except Exception as ex:  # noqa: BLE001
+            log("sharp: SelectByID2 EDGE raised %s", ex)
+    if not ok1:
+        log("sharp: IView.SelectEntity(edge, False)")
+        ok1 = bool(view_obj.SelectEntity(edges[int(e_ref)], False))
+        how1 = "SelectEntity"
+    log("sharp: edge selected=%s via %s", ok1, how1)
+
+    # 2) the sketch point — exactly like the macro: SelectByID2("Point<ID>", "SKETCHPOINT", x, y, 0, True, 0, Nothing, 0)
+    ok2, how = False, "none"
+    for nm in names + [""]:
+        log("sharp: SelectByID2 SKETCHPOINT name=%r at %s", nm, ip)
+        try:
+            if bool(ext.SelectByID2(nm, "SKETCHPOINT", ip[0], ip[1], 0.0, True, 0, None, 0)):
+                ok2, how = True, f"SelectByID2({nm!r})"
+                break
+        except Exception as ex:  # noqa: BLE001
+            log("sharp: SelectByID2 %r raised %s", nm, ex)
+    log("sharp: point selected=%s via %s", ok2, how)
+    if not ok1 or not ok2:
+        removed = False
+        try:
+            drawing.ClearSelection2(True)
+            log("sharp: EditUndo2(1) to remove the point")
+            removed = bool(drawing.EditUndo2(1))
+        except Exception:  # noqa: BLE001
+            removed = False
+        raise SWError(f"selection failed (edge {ok1} via {how1}, sketch point {ok2} via {how}) - "
+                      f"point at {ip} {'removed by undo' if removed else 'LEFT IN VIEW (run delete_view_sketch_points)'}")
+
+    # 3) AddDimension2 at the text point — as the macro
+    orig_pref = None
+    try:
+        orig_pref = app.GetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE)
+        app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, False)
+    except Exception:  # noqa: BLE001
+        pass
+    disp = None
+    try:
+        log("sharp: AddDimension2(%s, %s)", tx, ty)
+        try:
+            disp = drawing.AddDimension2(tx, ty, 0)
+        except Exception as ex:  # noqa: BLE001
+            log("sharp: AddDimension2 raised %s", ex)
+            disp = None
+        if disp is None:
+            log("sharp: Extension.AddDimension(%s, %s, 0, 0)", tx, ty)
+            try:
+                disp = ext.AddDimension(tx, ty, 0, 0)
+            except Exception as ex:  # noqa: BLE001
+                log("sharp: Extension.AddDimension raised %s", ex)
+                disp = None
+    finally:
+        if orig_pref is not None:
+            try:
+                app.SetUserPreferenceToggle(SW_INPUT_DIM_VAL_ON_CREATE, orig_pref)
+            except Exception:  # noqa: BLE001
+                pass
+    log("sharp: dimension object %s", "ok" if disp is not None else "None")
+    if disp is None:
+        raise SWError("AddDimension returned None after selecting edge + virtual sharp")
+    try:
+        disp.SetUnits2(True, SW_UNIT_MM, SW_FRACTION_DECIMAL, 0, False, 0)
+        disp.SetPrecision3(DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED)
+    except Exception:  # noqa: BLE001
+        pass
+    entry = {"status": "done", "view": vname, "point_selected_via": how,
+             "sharp_view_m": [round(ip[0], 6), round(ip[1], 6)],
+             "sharp_model_note": "view-sketch space = model point rotated into the view (m), no scale"}
+    info = slip._dim_info(disp)
+    entry["name"] = info.get("name"); entry["value"] = info.get("value")
+    entry["text_mm"] = info.get("text_mm") or [ax, ay]
+    if reference:
+        try:
+            slip._put(disp, "ShowParenthesis", True)
+            entry["reference"] = bool(slip._inv(disp, "ShowParenthesis"))
+        except Exception as e:  # noqa: BLE001
+            entry["reference_error"] = str(e)
+    drawing.ClearSelection2(True)
+    slip._rebuild(drawing)
+    return entry
 
 
 # --------------------------------------------------------------------------- batch dimensions
@@ -462,7 +777,9 @@ def _add_dimensions(view_name: str, dims: list[dict]) -> dict:
             if not text or len(text) != 2:
                 results.append({"n": n, "error": "text [x_mm, y_mm] is required"})
                 continue
-            tx, ty = float(text[0]) / _M_TO_MM, float(text[1]) / _M_TO_MM
+            ax, ay = float(text[0]), float(text[1])
+            ux, uy = slip._to_unbroken(vname, view_obj, ax, ay)
+            tx, ty = ux / _M_TO_MM, uy / _M_TO_MM
 
             drawing.ClearSelection2(True)
             ok1 = view_obj.SelectEntity(edges[e1], False)
@@ -576,13 +893,20 @@ def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool) -> dict:
         frag = ', ($PRPSHEET:"BEND_RADIUS" IN BEND RADIUS).'
         if frag in src:
             src = src.replace(frag, "."); edits.append("bend_radius_fragment")
-        fin = 'FINISH: $PRPSHEET:"FINISH", $PRPSHEET:"FINISH_COLOR"'
-        if fin in src:
-            src = src.replace(fin, f"FINISH: {finish_text}" if finish_text else 'FINISH: $PRPSHEET:"FINISH"')
-            edits.append("finish_color" if not finish_text else f"finish_literal:{finish_text}")
-        elif finish_text and 'FINISH: $PRPSHEET:"FINISH"' in src:
-            src = src.replace('FINISH: $PRPSHEET:"FINISH"', f"FINISH: {finish_text}")
-            edits.append(f"finish_literal:{finish_text}")
+        # Every note ends with a period (Simon, 2026-09-09): the template's FINISH line has none.
+        fin_lit = (f"FINISH: {finish_text.rstrip('.')}." if finish_text else 'FINISH: $PRPSHEET:"FINISH".')
+        for fin in ('FINISH: $PRPSHEET:"FINISH", $PRPSHEET:"FINISH_COLOR".',
+                    'FINISH: $PRPSHEET:"FINISH", $PRPSHEET:"FINISH_COLOR"',
+                    'FINISH: $PRPSHEET:"FINISH".', 'FINISH: $PRPSHEET:"FINISH"'):
+            if fin in src:
+                src = src.replace(fin, fin_lit)
+                edits.append(f"finish_literal:{finish_text}." if finish_text else "finish_color_dropped+period")
+                break
+        # (FINISH literal lines that were previously written without a period get one)
+        import re as _re
+        src, n_fix = _re.subn(r'(FINISH: [A-Z0-9 ,\-]+?)(?<!\.)(\r\n|<PARA)', r'\1.\2', src)
+        if n_fix:
+            edits.append("finish_period_added")
         lines = src.split("\r\n")
         for key, label in (("MASK AREAS SHOWN FROM FINISH", "mask_paragraph"), ("WHERE SHOWN", "revflag_paragraph")):
             hits = [i for i, ln in enumerate(lines) if key in ln]

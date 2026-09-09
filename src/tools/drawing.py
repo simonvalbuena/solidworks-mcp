@@ -166,7 +166,9 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         center: 放大區域中心點 {"x": mm, "y": mm}，sheet 絕對座標。
         radius: 放大區域半徑（mm）。
         label: 局部圖標記（A, B, C...），預設 "A"。
-        scale: 放大比例分子（如 2 表示 2:1），預設 2。
+        scale: DECIMAL view scale (1.0 = 1:1, 2.0 = 2:1, 0.5 = 1:2), default 2.
+        center/radius are ABSOLUTE SHEET mm (converted to the parent view's sketch space
+        internally, honouring view scale and rotation).
         position: 局部放大圖在 sheet 上的位置 {"x": mm, "y": mm}，預設父視圖右上方。"""
         try:
             result = await sw.execute(
@@ -491,10 +493,27 @@ def _insert_detail_view(
         pos_x = outline[2] + 0.05  # 右邊 + 50mm
         pos_y = outline[3]          # 上緣齊平
 
-    # 放大圓座標 mm → meters
-    cx = center["x"] * _MM_TO_M
-    cy = center["y"] * _MM_TO_M
-    r = radius * _MM_TO_M
+    # 放大圓座標: center/radius are SHEET mm. The circle is drawn in the parent
+    # view's sketch, whose space is model-oriented (unscaled, un-rotated):
+    #   sheet = C + s * R(angle) * p   =>   p = R(-angle) * (sheet - C) / s
+    import math
+    try:
+        vpos = view_obj.Position
+        vs = float(view_obj.ScaleDecimal)
+        try:
+            ang = float(view_obj.Angle)
+        except Exception:
+            ang = 0.0
+        dx = center["x"] * _MM_TO_M - vpos[0]
+        dy = center["y"] * _MM_TO_M - vpos[1]
+        ca, sa = math.cos(-ang), math.sin(-ang)
+        cx = (dx * ca - dy * sa) / vs
+        cy = (dx * sa + dy * ca) / vs
+        r = radius * _MM_TO_M / vs
+    except Exception:
+        cx = center["x"] * _MM_TO_M
+        cy = center["y"] * _MM_TO_M
+        r = radius * _MM_TO_M
 
     # COM 流程
     if not drawing.ActivateView(parent_view):
@@ -519,6 +538,15 @@ def _insert_detail_view(
     )
     if detail_view is None:
         raise SWError("無法建立局部放大圖")
+
+    # scale is a DECIMAL view scale (1.0 = 1:1, 0.5 = 1:2, 2.0 = 2:1)
+    try:
+        detail_view.ScaleDecimal = float(scale)
+    except Exception:
+        try:
+            detail_view.ScaleRatio = (float(scale), 1.0)
+        except Exception:
+            pass
 
     # Rebuild
     try:

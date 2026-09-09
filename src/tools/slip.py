@@ -77,6 +77,15 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         return await _run(sw, "set_view_display", _set_view_display, view_name, display_mode, tangent_edges)
 
     @mcp.tool()
+    async def rotate_view(view_name: str, angle_deg: float) -> str:
+        """Rotate a drawing view on the sheet (IView.Angle, absolute, degrees, counter-clockwise
+        positive). Use it to align a standard Bottom/Top view of a long tube with its Right/Left
+        views: solidpilot's 'bottom' view puts the model Z axis vertical; rotate_view(name, 90)
+        makes Z horizontal (sheet X = -Z, matching the Right view). Returns the resulting
+        ModelToViewTransform array so the orientation can be verified."""
+        return await _run(sw, "rotate_view", _rotate_view, view_name, angle_deg)
+
+    @mcp.tool()
     async def list_dimensions(view_name: str | None = None) -> str:
         """List display dimensions on drawing views (name like 'RD1@Drawing View1', value in
         document units, text position in sheet mm). view_name: one view, or omit for all views."""
@@ -272,6 +281,33 @@ def _set_view_display(view_name, display_mode: str, tangent_edges: str) -> dict:
             "tangent_edges": tangent_edges, "errors": errors}
 
 
+def _rotate_view(view_name: str, angle_deg: float) -> dict:
+    import math as _math
+    drawing = _active_drawing()
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"view {view_name!r} not found")
+    name, view = views[0]
+    rad = _math.radians(angle_deg)
+    try:
+        view.Angle = rad
+    except Exception:  # noqa: BLE001
+        _put(view, "Angle", rad)
+    _rebuild(drawing)
+    try:
+        got = view.Angle
+    except Exception:  # noqa: BLE001
+        got = _inv(view, "Angle")
+    arr = None
+    try:
+        xf = view.ModelToViewTransform
+        arr = [round(float(v), 6) for v in xf.ArrayData]
+    except Exception:  # noqa: BLE001
+        pass
+    return {"status": "done", "view": name, "angle_deg": round(_math.degrees(float(got)), 3),
+            "model_to_view_array": arr}
+
+
 def _delete_view(view_name: str) -> dict:
     drawing = _active_drawing()
     names = [n for n, _ in _get_drawing_views(drawing, None)]
@@ -310,7 +346,107 @@ def _iter_display_dims(view):
         dd = nxt
 
 
-def _dim_info(dd) -> dict:
+def _view_outline_m(view):
+    try:
+        o = view.GetOutline
+    except Exception:  # noqa: BLE001
+        o = _inv(view, "GetOutline")
+    return [float(v) for v in o]
+
+
+def _view_center_m(view):
+    try:
+        p = view.Position
+        return float(p[0]), float(p[1])
+    except Exception:  # noqa: BLE001
+        p = _inv(view, "Position")
+        return float(p[0]), float(p[1])
+
+
+_OUTLINE_MARGIN_MM = 11.5
+_BREAK_SHIFT: dict[str, dict] = {}   # view name -> {"orientation","shift_mm","center_mm"} (set by view_geometry)
+
+
+def _break_line_count(view) -> int:
+    try:
+        return int(_inv(view, "GetBreakLineCount"))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _is_broken(view) -> bool:
+    if _break_line_count(view) > 0:
+        return True
+    try:  # GetBreakLineCount is not always resolvable under late binding
+        bls = _inv(view, "GetBreakLines")
+        return bool(bls) and len(bls) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _break_orientation(view) -> str:
+    try:
+        bls = _inv(view, "GetBreakLines")
+        if bls:
+            return "vertical" if int(_inv(bls[0], "Orientation")) == 2 else "horizontal"
+    except Exception:  # noqa: BLE001
+        pass
+    return "vertical"
+
+
+def _record_break_shift(view_name: str, view, unbroken_bbox_mm) -> dict:
+    """Compute and cache the broken-view shift for view_name. SolidWorks keeps annotation
+    positions and ModelToViewTransform in UNBROKEN view space; on the sheet, geometry on the
+    low side of a break is drawn shifted +shift and the high side -shift (shift = removed/2).
+    unbroken_bbox_mm comes from view_geometry's transformed edges."""
+    info = {"broken": False, "orientation": None, "shift_mm": 0.0, "center_mm": None}
+    try:
+        cx, cy = _view_center_m(view)
+        info["center_mm"] = [round(cx * 1000, 2), round(cy * 1000, 2)]
+    except Exception:  # noqa: BLE001
+        pass
+    if _is_broken(view) and unbroken_bbox_mm and info["center_mm"]:
+        ol = [v * 1000 for v in _view_outline_m(view)]
+        info["broken"] = True
+        info["orientation"] = _break_orientation(view)
+        # GetOutline carries ~11-13 mm of margin per side around the visible geometry
+        # (measured 11.18 @1:8, 12.76 @1:2); removed span = unbroken width - visible width.
+        m = 2 * _OUTLINE_MARGIN_MM
+        if info["orientation"] == "vertical":
+            info["shift_mm"] = round(((unbroken_bbox_mm[2] - unbroken_bbox_mm[0]) - (ol[2] - ol[0] - m)) / 2, 3)
+        else:
+            info["shift_mm"] = round(((unbroken_bbox_mm[3] - unbroken_bbox_mm[1]) - (ol[3] - ol[1] - m)) / 2, 3)
+        info["note"] = ("shift is +/-2 mm (outline margin estimate); ONLY AddDimension's text point "
+                        "is in unbroken space - annotation SetPosition/GetPosition are actual sheet mm")
+    _BREAK_SHIFT[view_name] = info
+    return info
+
+
+def _to_unbroken(view_name: str, view, x_mm: float, y_mm: float) -> tuple:
+    """ACTUAL sheet point (what the eye sees) -> unbroken-space point SolidWorks expects for
+    annotation positions on a broken view. Uses the cached shift from view_geometry; if the
+    view is broken but nothing is cached, the point is returned unchanged."""
+    info = _BREAK_SHIFT.get(view_name)
+    if not info or not info.get("broken") or not _is_broken(view):
+        return x_mm, y_mm
+    s = info["shift_mm"]; cx, cy = info["center_mm"]
+    if info["orientation"] == "vertical":
+        return (x_mm - s, y_mm) if x_mm < cx else (x_mm + s, y_mm)
+    return (x_mm, y_mm - s) if y_mm < cy else (x_mm, y_mm + s)
+
+
+def _to_actual(view_name: str, x_mm: float, y_mm: float) -> tuple:
+    """Inverse of _to_unbroken (unbroken-space -> actual sheet)."""
+    info = _BREAK_SHIFT.get(view_name)
+    if not info or not info.get("broken"):
+        return x_mm, y_mm
+    s = info["shift_mm"]; cx, cy = info["center_mm"]
+    if info["orientation"] == "vertical":
+        return (x_mm + s, y_mm) if x_mm < cx else (x_mm - s, y_mm)
+    return (x_mm, y_mm + s) if y_mm < cy else (x_mm, y_mm - s)
+
+
+def _dim_info(dd, view_name: str | None = None) -> dict:
     info = {"name": None, "value": None, "text_mm": None}
     try:
         dim = _wrap(dd.GetDimension2(0))
@@ -321,6 +457,7 @@ def _dim_info(dd) -> dict:
     try:
         ann = _inv(dd, "GetAnnotation")
         pos = _inv(ann, "GetPosition")
+        # IAnnotation.GetPosition returns ACTUAL sheet coordinates (also on broken views)
         info["text_mm"] = [round(float(pos[0]) * 1000, 2), round(float(pos[1]) * 1000, 2)]
     except Exception:  # noqa: BLE001
         pass
@@ -332,7 +469,7 @@ def _list_dimensions(view_name) -> dict:
     out = []
     for name, view in _get_drawing_views(drawing, view_name):
         for dd in _iter_display_dims(view):
-            d = _dim_info(dd)
+            d = _dim_info(dd, name)
             d["view"] = name
             out.append(d)
     return {"count": len(out), "dimensions": out}
@@ -354,15 +491,18 @@ def _delete_dimension(dimension_name: str) -> dict:
 
 def _move_dimension_text(dimension_name: str, x_mm: float, y_mm: float) -> dict:
     drawing = _active_drawing()
-    for _name, view in _get_drawing_views(drawing, None):
+    for vname, view in _get_drawing_views(drawing, None):
         for dd in _iter_display_dims(view):
             info = _dim_info(dd)
             if info.get("name") == dimension_name:
                 ann = _inv(dd, "GetAnnotation")
+                # IAnnotation.SetPosition takes ACTUAL sheet coordinates even on broken views
+                # (verified on 108538: set -> read-back -> PDF all agree). No conversion here.
                 ok = ann.SetPosition(x_mm / 1000.0, y_mm / 1000.0, 0)
                 _rebuild(drawing)
+                after = _dim_info(dd, vname)
                 return {"status": "done", "dimension": dimension_name, "set_position_ok": bool(ok),
-                        "after": _dim_info(dd)}
+                        "requested_sheet_mm": [x_mm, y_mm], "after": after}
     raise SWError(f"dimension {dimension_name!r} not found")
 
 

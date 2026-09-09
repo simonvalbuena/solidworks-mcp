@@ -243,7 +243,10 @@ def _discover_view_names(drawing) -> list[str]:
     return found
 
 
-_VIEW_FEATURE_TYPES = ("AbsoluteView", "UnfoldedView", "DrDrawingView")
+_VIEW_FEATURE_TYPES = (
+    "AbsoluteView", "UnfoldedView", "DrDrawingView",
+    "DetailView", "SectionView", "AuxiliaryView", "RelativeView", "ProjectedView",
+)
 
 
 def _com_prop_or_method(obj, name):

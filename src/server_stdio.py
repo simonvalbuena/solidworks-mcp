@@ -18,6 +18,17 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     force=True,
 )
+# Also log to logs/server.log (DEBUG) so a SolidWorks crash can be diagnosed afterwards
+try:
+    _LOG_DIR = os.path.join(os.path.dirname(HERE), "logs")
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    _fh = logging.FileHandler(os.path.join(_LOG_DIR, "server.log"), encoding="utf-8")
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+    logging.getLogger().addHandler(_fh)
+    logging.getLogger().setLevel(logging.DEBUG)
+except Exception:  # noqa: BLE001
+    pass
 
 from server import mcp, sw  # noqa: E402  (registers all tools on import)
 

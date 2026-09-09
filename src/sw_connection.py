@@ -25,6 +25,15 @@ COM_TIMEOUT = int(os.environ.get("SW_COM_TIMEOUT", "90"))  # dense tube views ne
 _SHUTDOWN = object()
 
 
+_RPC_DEAD_MARKERS = ("0x800706BE", "0x800706BA", "0x80010108", "-2147023174", "-2147023170",
+                     "-2147417848", "RPC", "remote procedure call", "disconnected")
+
+
+def _is_rpc_dead(exc: Exception) -> bool:
+    text = str(exc)
+    return any(m.lower() in text.lower() for m in _RPC_DEAD_MARKERS)
+
+
 class SWConnection:
     """SolidWorks COM 連線管理（Singleton）。"""
 
@@ -119,10 +128,28 @@ class SWConnection:
                 return
             func, args, kwargs, future = item
             try:
+                self._ensure_alive()
                 result = func(*args, **kwargs)
                 future.set_result(result)
             except Exception as e:
+                if _is_rpc_dead(e):
+                    # SolidWorks died (crash / closed): drop the stale proxy so the next call
+                    # re-attaches to the relaunched instance instead of failing forever.
+                    logger.warning("SolidWorks COM link lost (%s); will reconnect on next call", e)
+                    self._sw_app = None
                 future.set_exception(e)
+
+    def _ensure_alive(self) -> None:
+        """Re-attach to SolidWorks when the cached proxy is gone or points at a dead process."""
+        app = self._sw_app
+        if app is not None:
+            try:
+                _ = app.Visible  # cheap liveness probe
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("SolidWorks proxy dead (%s); reconnecting", e)
+                self._sw_app = None
+        self._init_com()
 
     async def execute(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
         if not self._running:
