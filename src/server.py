@@ -31,6 +31,7 @@ def register_all_tools() -> None:
     from tools.slip import register_tools as register_slip
     from tools.slip_batch import register_tools as register_slip_batch
     from tools.slip_tube import register_tools as register_slip_tube
+    from tools.slip_views import register_tools as register_slip_views
 
     register_file_ops(mcp, sw)
     register_drawing(mcp, sw)
@@ -40,6 +41,7 @@ def register_all_tools() -> None:
     register_slip(mcp, sw)
     register_slip_batch(mcp, sw)
     register_slip_tube(mcp, sw)
+    register_slip_views(mcp, sw)
 
 
 register_all_tools()
