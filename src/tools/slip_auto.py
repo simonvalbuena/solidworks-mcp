@@ -73,16 +73,17 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         scale: float | None = None,
         save_path: str | None = None,
         rotate_base_deg: float = 0.0,
+        create_new: bool = False,
     ) -> str:
-        """Lay out a Slip part drawing on the ACTIVE drawing (create it first from the Slip
-        template, e.g. solidpilot.create_drawing): ONE base model view (base_view: top|front|
+        """Lay out a Slip part drawing on the ACTIVE drawing (or, create_new=True / no drawing
+        open, on a new one from the Slip D-size template SR FAB D DWG 2026): ONE base model view (base_view: top|front|
         right|... or 'auto' = look along the thin axis), PROJECTED views (edge_views: 'auto' =
         'bottom' for a flat plate, 'bottom,right' for a bent part; or a comma list), a small iso at
         lower-right, standard scale chosen to fit ~1/3 of the sheet (or `scale`), HLR + tangent
         edges removed (iso visible), saved to save_path (default C:\\Drawings\\<PN>.SLDDRW).
         Returns view names, roles, outlines and the scale — feed to dimension_slip_views."""
         return await _run(sw, "layout_slip_part", _layout_slip_part, model_path, base_view,
-                          edge_views, scale, save_path, rotate_base_deg)
+                          edge_views, scale, save_path, rotate_base_deg, create_new)
 
     @mcp.tool()
     async def dimension_slip_views(
@@ -118,10 +119,97 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
                           sheet_name, x_mm, y_mm)
 
     @mcp.tool()
-    async def export_slip_pdf(pdf_path: str | None = None, save: bool = True) -> str:
+    async def export_slip_pdf(pdf_path: str | None = None, save: bool = True, png_per_sheet: bool = False) -> str:
         """Save the active drawing and export it to PDF (default <drawing dir>\\<PN>-<REV>.pdf,
-        REV from the model's REVISION property or R00). Uses SaveAs3 with ByRef VARIANTs."""
-        return await _run(sw, "export_slip_pdf", _export_slip_pdf, pdf_path, save)
+        REV from the model's REVISION property or R00); png_per_sheet=True also writes
+        <PN>-<REV>-Sheet1.png / -Sheet2.png for the visual check. SaveAs3 with ByRef VARIANTs."""
+        return await _run(sw, "export_slip_pdf", _export_slip_pdf, pdf_path, save, png_per_sheet)
+
+    @mcp.tool()
+    async def make_slip_drawing(
+        model_path: str,
+        base_view: str = "auto",
+        edge_views: str = "auto",
+        scale: float | None = None,
+        save_dir: str = r"C:\Drawings",
+        bend_radius_text: str | None = None,
+        finish_text: str | None = None,
+        export: bool = True,
+    ) -> str:
+        """The whole Slip R00 part drawing in ONE call: part_brief -> new drawing from the Slip
+        D-size template -> layout_slip_part -> dimension_slip_views -> slip_flat_sheet (bent parts)
+        -> finish_slip_r00 (notes, display, bend-radius literal = bend_radius_text or the measured
+        (R)) -> save + PDF + one PNG per sheet. Each stage runs as its own COM job; the report
+        carries every stage's result and stops at the first stage that is not clean ("partial"),
+        so the step tools can repair from there. Returns the combined report."""
+        return await _make_slip_drawing(sw, model_path, base_view, edge_views, scale, save_dir,
+                                        bend_radius_text, finish_text, export)
+
+
+async def _make_slip_drawing(sw, model_path, base_view, edge_views, scale, save_dir, bend_radius_text, finish_text, export):
+    import time
+    from tools import slip_batch as _sb
+    t0 = time.time()
+    rep: dict = {"status": "done", "stages": {}}
+
+    async def stage(name, fn, *args):
+        t = time.time()
+        try:
+            r = await sw.execute(fn, *args)
+        except SWError as e:
+            r = {"status": "error", "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("make_slip_drawing stage %s crashed", name)
+            r = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        r["seconds"] = round(time.time() - t, 1)
+        rep["stages"][name] = r
+        return r
+
+    brief = await stage("brief", _part_brief, model_path)
+    if brief.get("status") != "done":
+        rep["status"] = "partial"; rep["seconds"] = round(time.time() - t0, 1)
+        return json.dumps(rep, ensure_ascii=False)
+    pn = os.path.splitext(os.path.basename(model_path))[0]
+    save_path = os.path.join(save_dir, f"{pn}.SLDDRW")
+    lay = await stage("layout", _layout_slip_part, model_path, base_view, edge_views, scale, save_path, 0.0, True)
+    if lay.get("status") != "done":
+        rep["status"] = "partial"; rep["seconds"] = round(time.time() - t0, 1)
+        return json.dumps(rep, ensure_ascii=False)
+    roles = {v.get("role"): v.get("name") for v in lay.get("views", []) if v.get("name")}
+    thk = brief.get("thickness_in")
+    br = brief.get("bend_radius_in")
+    dims = await stage("dimensions", _dimension_slip_views, roles.get("base"), roles.get("edge"), roles.get("side"), thk, br, "top_left")
+    if dims.get("status") != "done":
+        rep["status"] = "partial"; rep["seconds"] = round(time.time() - t0, 1)
+        return json.dumps(rep, ensure_ascii=False)
+    # measured bend radius (R) for the material note when the property is blank
+    measured_r = None
+    for vname, vr in dims.get("views", {}).items():
+        for d in vr.get("dims", []) if isinstance(vr, dict) else []:
+            if d.get("label") == "bend_r" and d.get("value"):
+                measured_r = d["value"]
+    bent = bool(brief.get("bent"))
+    if bent:
+        flat = await stage("flat_sheet", _slip_flat_sheet, model_path, roles.get("base"), None, "Sheet2", 431.8, 279.4)
+        if flat.get("status") != "done":
+            rep["status"] = "partial"; rep["seconds"] = round(time.time() - t0, 1)
+            return json.dumps(rep, ensure_ascii=False)
+    br_text = bend_radius_text
+    if br_text is None and bent and not br and measured_r:
+        br_text = f"{measured_r:.3f}"
+    fin_text = finish_text
+    if fin_text is None and not (brief.get("props") or {}).get("FINISH"):
+        fin_text = "NONE"
+    fin = await stage("finish", _sb._finish_slip_r00, roles.get("iso"), fin_text, not bent, br_text, "Sheet1", False)
+    if fin.get("status") != "done":
+        rep["status"] = "partial"
+    if export:
+        ex = await stage("export", _export_slip_pdf, None, True, True)
+        if ex.get("status") != "done":
+            rep["status"] = "partial"
+    rep["views"] = roles
+    rep["seconds"] = round(time.time() - t0, 1)
+    return json.dumps(rep, ensure_ascii=False)
 
 
 async def _run(sw, tool_name, fn, *args):
@@ -296,35 +384,45 @@ def _part_brief(model_path: str) -> dict:
 
 # --------------------------------------------------------------------------- layout
 
+SLIP_TEMPLATE = r"C:\SLIP_ROBOTICS_VAULT\SOLIDWORKS SETUP\START FILE TEMPLATES\SR FAB D DWG 2026.DRWDOT"
+
+
 def _find_slip_template() -> str | None:
-    pats = [r"C:\ProgramData\SolidWorks\SOLIDWORKS *\templates\*.drwdot",
+    if os.path.isfile(SLIP_TEMPLATE):
+        return SLIP_TEMPLATE
+    pats = [os.path.join(os.path.dirname(SLIP_TEMPLATE), "*.drwdot"),
+            r"C:\ProgramData\SolidWorks\SOLIDWORKS *\templates\*.drwdot",
             r"C:\ProgramData\SOLIDWORKS\SOLIDWORKS *\templates\*.drwdot"]
     hits = []
     for p in pats:
         hits += glob.glob(p)
-    pref = [h for h in hits if any(k in os.path.basename(h).upper() for k in ("SLIP", " SR ", "SR_", "SR-", "FORMAT SR"))]
-    return (pref or [None])[0]
+    pref = [h for h in hits if any(k in os.path.basename(h).upper() for k in ("SR FAB", "SLIP", " SR ", "SR_", "SR-", "FORMAT SR"))]
+    return (pref or hits or [None])[0]
 
 
-def _ensure_drawing(app):
-    doc = _try(lambda: app.ActiveDoc)
-    if doc is not None and _try(lambda: int(slip._inv(doc, "GetType"))) == 3:
-        return doc, None
-    # any open drawing (most recently created first is not knowable; take the first found)
-    d = _try(lambda: app.GetFirstDocument)
-    while d is not None:
-        if _try(lambda: int(slip._inv(d, "GetType"))) == 3:
-            _try(lambda: sv._activate_doc(app, str(_val(d, "GetTitle"))))
-            return d, None
-        d = _try(lambda: _val(d, "GetNext"))
+def _new_slip_drawing(app):
+    """Create a new drawing from the Slip D-size template (fork-side; no solidpilot hop)."""
     tpl = _find_slip_template()
     if not tpl:
-        raise SWError("no active drawing and no Slip .drwdot found in the SolidWorks templates folder — "
-                      "create the drawing first (solidpilot.create_drawing)")
-    d = app.NewDocument(tpl, 4, 0.0, 0.0)  # swDwgPaperDsize=4 (ignored when the template carries its sheet format)
+        raise SWError(f"Slip drawing template not found ({SLIP_TEMPLATE})")
+    d = app.NewDocument(tpl, 4, 0.0, 0.0)  # swDwgPaperDsize=4 (the template carries its own sheet format)
     if d is None:
         raise SWError(f"NewDocument failed for template {tpl}")
     return d, tpl
+
+
+def _ensure_drawing(app, create_new: bool = False):
+    if not create_new:
+        doc = _try(lambda: app.ActiveDoc)
+        if doc is not None and _try(lambda: int(slip._inv(doc, "GetType"))) == 3:
+            return doc, None
+        d = _try(lambda: app.GetFirstDocument)
+        while d is not None:
+            if _try(lambda: int(slip._inv(d, "GetType"))) == 3:
+                _try(lambda: sv._activate_doc(app, str(_val(d, "GetTitle"))))
+                return d, None
+            d = _try(lambda: _val(d, "GetNext"))
+    return _new_slip_drawing(app)
 
 
 def _view_by_name(drawing, name):
@@ -386,10 +484,10 @@ def _save_drawing_as(drawing, path: str) -> dict:
     return {"saved": None, "error": f"all SaveAs variants failed (errors={_try(lambda: errs.value)})"}
 
 
-def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotate_base_deg) -> dict:
+def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotate_base_deg, create_new=False) -> dict:
     app = SWConnection.get_instance().get_app()
     # the drawing FIRST (opening/activating the part changes ActiveDoc)
-    drawing, tpl = _ensure_drawing(app)
+    drawing, tpl = _ensure_drawing(app, create_new)
     dtitle = _try(lambda: str(_val(drawing, "GetTitle")))
     part = _open_part(app, model_path)
     brief = _brief_dict(app, part, model_path)
@@ -787,47 +885,61 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm) -> di
         g = _geom(name)
         return g, _norm_pattern(g["summary"], g["edges"])
 
-    # brute force: flip False first; only re-insert flipped when no rotation matches the base view
+    # ONE measurement per insert; rotations are evaluated mathematically (base-view hole pattern
+    # match). Insert un-flipped first; only when no rotation matches, re-insert flipped. Flip is the
+    # 7th argument of CreateFlatPatternViewFromModelView3 (variant 1) — the 6th does nothing.
     tried = []
     fname = fview = None
     best = None
     unflipped_sig = None
-    # (flip, variant): unflipped first; then the three ways SolidWorks may accept a flip — keep the first
-    # one that actually changes the geometry (the API is ambiguous about the Flip argument position)
-    for flip, variant in ((False, 0), (True, 0), (True, 1), (True, 2)):
+    for flip, variant in ((False, 0), (True, 1), (True, 2)):
         if fname:
             _try(lambda: slip._delete_view(fname))
         fname, fview = _insert_flat_view(drawing, model_path, cfg, x_mm, y_mm, flip, variant)
         _set_scale(fview, s)
-        set_angle(fview, 0)
+        slip._rebuild(drawing)
         g0, p0 = measure(fname)
         sig = tuple(sorted((rk, round(u, 3), round(v, 3)) for rk, u, v in p0))
         if not flip:
             unflipped_sig = sig
         elif sig == unflipped_sig:
             tried.append({"flip": True, "variant": variant, "note": "no effect"})
-            continue  # this flip variant did nothing — try the next
+            continue
         bb0 = g0["summary"]["bbox_mm"]
         flat_aspect0 = (bb0[2] - bb0[0]) >= (bb0[3] - bb0[1])
         rots = [0, 180] if flat_aspect0 == base_aspect else [-90, 90]
         for ang in rots:
-            set_angle(fview, ang)
-            _, p = measure(fname)
-            err = _pattern_error(base_pat, p) + _pattern_error(p, base_pat)
+            pred = _transform_pattern(p0, ang, False)
+            err = _pattern_error(base_pat, pred) + _pattern_error(pred, base_pat)
             tried.append({"flip": flip, "variant": variant, "angle": ang, "err": round(err, 3)})
             if best is None or err < best[0]:
                 best = (err, flip, ang, variant)
         if best and best[1] == flip and best[0] < 0.15:
             break
         if flip:
-            break  # a working flip variant was found and measured; stop trying others
+            break
     err_best, flip, ang, variant = best
-    cur_flip = tried[-1].get("flip") if tried else False
-    if fview is not None and (flip != cur_flip):
+    cur_flip = next((t["flip"] for t in reversed(tried) if "angle" in t), False)
+    if flip != cur_flip:
         _try(lambda: slip._delete_view(fname))
         fname, fview = _insert_flat_view(drawing, model_path, cfg, x_mm, y_mm, flip, variant)
         _set_scale(fview, s)
     set_angle(fview, ang)
+    # one verification measurement of the final choice (the math and SolidWorks must agree)
+    _, pv = measure(fname)
+    err_after = _pattern_error(base_pat, pv) + _pattern_error(pv, base_pat)
+    if err_after > err_best + 0.5:
+        logger.info("flat orientation: predicted err %.3f, measured %.3f — falling back to measured rotations", err_best, err_after)
+        bb0 = _geom(fname)["summary"]["bbox_mm"]
+        for ang2 in ([0, 180] if ((bb0[2] - bb0[0]) >= (bb0[3] - bb0[1])) == base_aspect else [-90, 90]):
+            set_angle(fview, ang2)
+            _, p2 = measure(fname)
+            e2 = _pattern_error(base_pat, p2) + _pattern_error(p2, base_pat)
+            tried.append({"flip": flip, "measured_angle": ang2, "err": round(e2, 3)})
+            if e2 < err_after:
+                err_after, ang = e2, ang2
+        set_angle(fview, ang)
+    err_best = err_after
     _try(lambda: slip._set_view_display(fname, "hidden_lines_removed", "removed"))
     _set_pos(fview, x_mm, y_mm)
     slip._rebuild(drawing)
@@ -869,7 +981,7 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm) -> di
 
 # --------------------------------------------------------------------------- export
 
-def _export_slip_pdf(pdf_path, save) -> dict:
+def _export_slip_pdf(pdf_path, save, png_per_sheet=False) -> dict:
     drawing = slip._active_drawing()
     out = {"status": "done"}
     path = _try(lambda: str(_val(drawing, "GetPathName"))) or ""
@@ -903,4 +1015,20 @@ def _export_slip_pdf(pdf_path, save) -> dict:
     out["pdf_errors"] = _try(lambda: errs.value)
     if not ok:
         out["status"] = "partial"
+    if png_per_sheet:
+        # one PNG per sheet for the visual check (SaveAs .png renders the ACTIVE sheet)
+        pngs = []
+        cur = _try(lambda: slip._current_sheet_name(drawing))
+        for sh in _try(lambda: slip._sheet_names(drawing), []) or []:
+            try:
+                drawing.ActivateSheet(sh)
+                png = os.path.splitext(pdf_path)[0] + f"-{sh}.png"
+                e2, w2 = _byref_i4(), _byref_i4()
+                if bool(drawing.Extension.SaveAs3(png, 0, 1, null, null, e2, w2)):
+                    pngs.append(png)
+            except Exception as ex:  # noqa: BLE001
+                logger.info("png export %s: %s", sh, ex)
+        if cur:
+            _try(lambda: drawing.ActivateSheet(cur))
+        out["png"] = pngs
     return out
