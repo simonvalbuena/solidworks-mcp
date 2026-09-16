@@ -640,7 +640,9 @@ def _select_segment(drawing, seg, mid_sketch_m, append: bool, sheet_mid_mm=None)
     if sheet_mid_mm:
         for cand in sheet_mid_mm:
             for radius in (0.001, 0.003):
-                for z0, sel_type in ((0.0, 9), (1.0, 9)):
+                # swSelEXTSKETCHSEGS=24 (model sketch entities shown in a view, e.g. bend lines),
+                # swSelSKETCHSEGS=10. (9 is swSelSKETCHES - wrong, cost one bad dimension.)
+                for z0, sel_type in ((0.0, 24), (0.0, 10), (1.0, 24), (1.0, 10)):
                     try:
                         ok = bool(ext.SelectByRay(cand[0] / _M_TO_MM, cand[1] / _M_TO_MM, z0,
                                                   0.0, 0.0, -1.0, radius, sel_type, append, 0, 0))
@@ -661,25 +663,17 @@ def _select_segment(drawing, seg, mid_sketch_m, append: bool, sheet_mid_mm=None)
     if sheet_mid_mm:
         pts += [(c[0] / _M_TO_MM, c[1] / _M_TO_MM) for c in sheet_mid_mm]
     for nm in ([name] if name else []) + [""]:
-        for px, py in pts:
-            try:
-                ok = bool(ext.SelectByID2(nm, "SKETCHSEGMENT", px, py, 0.0, append, 0, null_disp, 0))
-                logger.info("bend select SelectByID2 %r at (%.4f, %.4f) -> %s", nm, px, py, ok)
-                if ok:
-                    return True, f"SelectByID2({nm!r})"
-            except Exception as ex:  # noqa: BLE001
-                logger.info("bend select SelectByID2 %r raised %s", nm, ex)
-    try:
-        sd = drawing.SelectionManager.CreateSelectData
-        if bool(seg.Select4(append, sd)):
-            return True, "Select4(SelectData)"
-    except Exception as ex:  # noqa: BLE001
-        logger.info("bend select Select4 raised %s", ex)
-    try:
-        if bool(seg.Select2(append, 0)):
-            return True, "Select2"
-    except Exception as ex:  # noqa: BLE001
-        logger.info("bend select Select2 raised %s", ex)
+        for typ in ("EXTSKETCHSEGMENT", "SKETCHSEGMENT"):
+            for px, py in pts:
+                try:
+                    ok = bool(ext.SelectByID2(nm, typ, px, py, 0.0, append, 0, null_disp, 0))
+                    logger.info("bend select SelectByID2 %r %s at (%.4f, %.4f) -> %s", nm, typ, px, py, ok)
+                    if ok:
+                        return True, f"SelectByID2({nm!r},{typ})"
+                except Exception as ex:  # noqa: BLE001
+                    logger.info("bend select SelectByID2 %r raised %s", nm, ex)
+    # ISketchSegment.Select4/Select2 are NOT used: they report True but select the wrong entity
+    # (108789: produced a hole-to-hole 5.750 instead of edge-to-bend-line).
     return False, "none"
 
 
@@ -728,6 +722,19 @@ def _add_bend_dimensions(view_name, dims) -> dict:
             logger.info("bend dim %s: seg=%s via %s, edge=%s, selected=%s", n, ok2, how, ok1, n_sel)
             if n_sel != -1 and n_sel < 2:
                 ok1 = False
+            if not (ok1 and ok2):
+                # Order B: edge FIRST (fresh), bend line APPENDED
+                drawing.ClearSelection2(True)
+                ok1 = bool(vobj.SelectEntity(edges[e], False))
+                ok2, how = _select_segment(drawing, seg, mid, True, cands) if ok1 else (False, "skipped")
+                how = f"orderB:{how}"
+                try:
+                    n_sel = int(drawing.SelectionManager.GetSelectedObjectCount2(-1))
+                except Exception:  # noqa: BLE001
+                    n_sel = -1
+                logger.info("bend dim %s (order B): edge=%s, seg=%s via %s, selected=%s", n, ok1, ok2, how, n_sel)
+                if n_sel != -1 and n_sel < 2:
+                    ok2 = False
             if not ok1 or not ok2:
                 results.append({"n": n, "error": f"selection failed (edge {ok1}, bend line {ok2} via {how})"})
                 continue
