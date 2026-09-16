@@ -101,14 +101,20 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         iso_view: str | None = "Drawing View3",
         finish_text: str | None = None,
         delete_sheet2: bool = True,
+        bend_radius_text: str | None = None,
+        notes_sheet: str = "Sheet1",
+        export_pdf: bool = False,
     ) -> str:
-        """One-call R00 finish for a Slip flat/sheet-metal part drawing: every view Hidden Lines
-        Removed with tangent edges REMOVED, the iso view (iso_view) tangent edges VISIBLE, delete
-        Sheet2, and clean the notes block: drop the bend-radius fragment, drop FINISH_COLOR (or
-        replace the FINISH line with a literal, e.g. finish_text="NONE" when the part property is
-        blank), remove the MASK paragraph and the rev-flag paragraph. Every step is tolerant of
-        already-clean input. Returns a compact summary with the final note lines."""
-        return await slip._run(sw, "finish_slip_r00", _finish_slip_r00, iso_view, finish_text, delete_sheet2)
+        """One-call R00 finish for a Slip part drawing: every view Hidden Lines Removed with
+        tangent edges REMOVED, the iso view (iso_view) tangent edges VISIBLE, delete Sheet2
+        (delete_sheet2=False for a formed part with a flat-pattern sheet), activate notes_sheet and
+        clean the notes block: bend-radius fragment -> dropped (flat part) or replaced by the
+        literal bend_radius_text (e.g. "0.102" -> "(0.102 IN BEND RADIUS)" when the BEND_RADIUS
+        property is blank), FINISH_COLOR dropped (or FINISH line replaced by finish_text), MASK and
+        rev-flag paragraphs removed, every note ending with a period. export_pdf=True also saves and
+        writes <PN>-<REV>.pdf beside the drawing. Tolerant of already-clean input."""
+        return await slip._run(sw, "finish_slip_r00", _finish_slip_r00, iso_view, finish_text, delete_sheet2,
+                               bend_radius_text, notes_sheet, export_pdf)
 
 
 # --------------------------------------------------------------------------- geometry
@@ -891,9 +897,17 @@ def _find_notes_block(drawing):
     raise SWError("notes block not found on current sheet (no note containing 'INTERPRET ALL DIMENSIONS')")
 
 
-def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool) -> dict:
+def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool, bend_radius_text=None,
+                     notes_sheet="Sheet1", export_pdf=False) -> dict:
     drawing = slip._active_drawing()
     report: dict = {"status": "done", "steps": []}
+    # the notes block lives on Sheet1; the flat-pattern step leaves Sheet2 active
+    try:
+        if notes_sheet and slip._current_sheet_name(drawing) != notes_sheet and notes_sheet in slip._sheet_names(drawing):
+            drawing.ActivateSheet(notes_sheet)
+            report["steps"].append({"activated_sheet": notes_sheet})
+    except Exception as e:  # noqa: BLE001
+        report["steps"].append({"activate_sheet_error": str(e)})
 
     # 1. display style
     try:
@@ -927,7 +941,11 @@ def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool) -> dict:
         src = info.get("linked_text") or ""
         edits = []
         frag = ', ($PRPSHEET:"BEND_RADIUS" IN BEND RADIUS).'
-        if frag in src:
+        if bend_radius_text:
+            lit = str(bend_radius_text).strip().rstrip(".")
+            if frag in src:
+                src = src.replace(frag, f", ({lit} IN BEND RADIUS)."); edits.append(f"bend_radius_literal:{lit}")
+        elif frag in src:
             src = src.replace(frag, "."); edits.append("bend_radius_fragment")
         # Every note ends with a period (Simon, 2026-09-09): the template's FINISH line has none.
         fin_lit = (f"FINISH: {finish_text.rstrip('.')}." if finish_text else 'FINISH: $PRPSHEET:"FINISH".')
@@ -965,4 +983,11 @@ def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool) -> dict:
         report["notes_error"] = str(e)
         report["status"] = "partial"
 
+    if export_pdf:
+        try:
+            from tools.slip_auto import _export_slip_pdf  # lazy: slip_auto imports this module
+            report["export"] = _export_slip_pdf(None, True)
+        except Exception as e:  # noqa: BLE001
+            report["export_error"] = str(e)
+            report["status"] = "partial"
     return report
