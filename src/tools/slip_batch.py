@@ -51,7 +51,7 @@ _IN = 25.4
 
 def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
     @mcp.tool()
-    async def view_geometry(view_name: str | None = None, include_edges: bool = True) -> str:
+    async def view_geometry(view_name: str | None = None, include_edges: bool = True, out_path: str | None = None) -> str:
         """Geometry of drawing view(s) in SHEET millimetres (origin bottom-left of the sheet).
         Returns per view: outline [xmin,ymin,xmax,ymax], scale, edges (index, type, sheet
         start/end/center, length, radius) and a summary: envelope size in inches, the edge
@@ -59,7 +59,16 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         segment on the outer side is chosen when an edge is split by a tab/notch), and circles
         grouped by diameter with the top-left instance flagged. Feed the indices straight into
         add_dimensions. include_edges=False returns only outline + summary (small)."""
-        return await slip._run(sw, "view_geometry", _view_geometry, view_name, include_edges)
+        out = await slip._run(sw, "view_geometry", _view_geometry, view_name, include_edges)
+        if out_path:
+            # full geometry to disk (offline dry-runs of the dimensioning rules); the reply stays a one-line summary
+            import os as _os
+            _os.makedirs(_os.path.dirname(out_path) or ".", exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(out)
+            d = json.loads(out)
+            return json.dumps({"written": out_path, "views": [{"view": v.get("view"), "edges": len(v.get("edges", [])), "bbox_mm": v.get("summary", {}).get("bbox_mm")} for v in d.get("views", [])]})
+        return out
 
     @mcp.tool()
     async def add_dimensions(view_name: str, dims: list[dict]) -> str:
@@ -104,17 +113,20 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         bend_radius_text: str | None = None,
         notes_sheet: str = "Sheet1",
         export_pdf: bool = False,
+        keep_bend_fragment: bool = False,
     ) -> str:
         """One-call R00 finish for a Slip part drawing: every view Hidden Lines Removed with
         tangent edges REMOVED, the iso view (iso_view) tangent edges VISIBLE, delete Sheet2
         (delete_sheet2=False for a formed part with a flat-pattern sheet), activate notes_sheet and
         clean the notes block: bend-radius fragment -> dropped (flat part) or replaced by the
         literal bend_radius_text (e.g. "0.102" -> "(0.102 IN BEND RADIUS)" when the BEND_RADIUS
-        property is blank), FINISH_COLOR dropped (or FINISH line replaced by finish_text), MASK and
-        rev-flag paragraphs removed, every note ending with a period. export_pdf=True also saves and
-        writes <PN>-<REV>.pdf beside the drawing. Tolerant of already-clean input."""
+        property is blank) or KEPT as the property link when keep_bend_fragment=True (a bent part
+        whose BEND_RADIUS property is filled), FINISH_COLOR dropped (or FINISH line replaced by
+        finish_text), MASK and rev-flag paragraphs removed, every note ending with a period.
+        export_pdf=True also saves and writes <PN>-<REV>.pdf beside the drawing. Tolerant of
+        already-clean input."""
         return await slip._run(sw, "finish_slip_r00", _finish_slip_r00, iso_view, finish_text, delete_sheet2,
-                               bend_radius_text, notes_sheet, export_pdf)
+                               bend_radius_text, notes_sheet, export_pdf, keep_bend_fragment)
 
 
 # --------------------------------------------------------------------------- geometry
@@ -898,7 +910,7 @@ def _find_notes_block(drawing):
 
 
 def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool, bend_radius_text=None,
-                     notes_sheet="Sheet1", export_pdf=False) -> dict:
+                     notes_sheet="Sheet1", export_pdf=False, keep_bend_fragment=False) -> dict:
     drawing = slip._active_drawing()
     report: dict = {"status": "done", "steps": []}
     # the notes block lives on Sheet1; the flat-pattern step leaves Sheet2 active
@@ -941,7 +953,9 @@ def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool, bend_radius_tex
         src = info.get("linked_text") or ""
         edits = []
         frag = ', ($PRPSHEET:"BEND_RADIUS" IN BEND RADIUS).'
-        if bend_radius_text:
+        if keep_bend_fragment:
+            edits.append("bend_radius_fragment_kept")   # bent part with a filled BEND_RADIUS property: the link stays (literal only as fallback below)
+        elif bend_radius_text:
             lit = str(bend_radius_text).strip().rstrip(".")
             if frag in src:
                 src = src.replace(frag, f", ({lit} IN BEND RADIUS)."); edits.append(f"bend_radius_literal:{lit}")
@@ -978,6 +992,18 @@ def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool, bend_radius_tex
             slip._rebuild(drawing)
         after = slip._note_info(note)
         text_lines = [ln for ln in (after.get("text") or "").replace("\r\n", "\n").split("\n") if ln.strip()]
+        # A kept $PRPSHEET:"BEND_RADIUS" link can still resolve to nothing on the sheet ("(- IN BEND
+        # RADIUS)" — 108689: the property lives where the sheet link does not see it). Then the literal
+        # bend_radius_text (the property value or the measured (R)) replaces the link after all.
+        if keep_bend_fragment and bend_radius_text and any(
+                _re.search(r"\((?:-|\s*) IN BEND RADIUS\)", ln) for ln in text_lines) and frag in new_src:
+            lit = str(bend_radius_text).strip().rstrip(".")
+            new_src = new_src.replace(frag, f", ({lit} IN BEND RADIUS).")
+            slip._put(note, "PropertyLinkedText", new_src)
+            slip._rebuild(drawing)
+            edits.append(f"bend_radius_link_unresolved->literal:{lit}")
+            after = slip._note_info(note)
+            text_lines = [ln for ln in (after.get("text") or "").replace("\r\n", "\n").split("\n") if ln.strip()]
         report["notes"] = {"note": name, "edits": edits, "lines": text_lines}
     except Exception as e:  # noqa: BLE001
         report["notes_error"] = str(e)

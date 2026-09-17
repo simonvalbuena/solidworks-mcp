@@ -213,12 +213,15 @@ async def _make_slip_drawing(sw, model_path, base_view, edge_views, scale, save_
             rep["status"] = "partial"; rep["seconds"] = round(time.time() - t0, 1)
             return json.dumps(rep, ensure_ascii=False)
     br_text = bend_radius_text
-    if br_text is None and bent and not br and measured_r:
-        br_text = f"{measured_r:.3f}"
+    keep_link = bool(bent and br is not None and br_text is None)   # property filled: keep the $PRPSHEET link ...
+    if br_text is None and bent:
+        # ... with a literal fallback (property value, else the measured (R)) for when the link resolves to "-"
+        br_text = (f"{br:.4g}" if br is not None else (f"{measured_r:.3f}" if measured_r else None))
     fin_text = finish_text
     if fin_text is None and not (brief.get("props") or {}).get("FINISH"):
         fin_text = "NONE"
-    fin = await stage("finish", _sb._finish_slip_r00, roles.get("iso"), fin_text, not bent, br_text, "Sheet1", False)
+    # bent part with a filled BEND_RADIUS property: keep the $PRPSHEET link in the material note (108689)
+    fin = await stage("finish", _sb._finish_slip_r00, roles.get("iso"), fin_text, not bent, br_text, "Sheet1", False, keep_link)
     if fin.get("status") != "done":
         rep["status"] = "partial"
     if export:
@@ -637,6 +640,98 @@ def _pick_hole(summary, edges, mode: str):
     return min(circles, key=lambda c: (c["c"][0] - bb[0]) + (bb[3] - c["c"][1]))
 
 
+def _face_regions(summary, edges):
+    """Separator coordinates that split a view into FACE regions: a line running (almost) the full
+    width/height of the view strictly inside its outline is a wall seen edge-on — a bend between two
+    faces (108689 side view: the two side walls split the spine face from the two ear faces)."""
+    bb = summary["bbox_mm"]
+    w, h = bb[2] - bb[0], bb[3] - bb[1]
+    ys = {round(r["s"][1], 1) for r in _lines(edges, horizontal=True)
+          if r.get("len", 0) >= 0.8 * w and bb[1] + 1.0 < r["s"][1] < bb[3] - 1.0}
+    xs = {round(r["s"][0], 1) for r in _lines(edges, horizontal=False)
+          if r.get("len", 0) >= 0.8 * h and bb[0] + 1.0 < r["s"][0] < bb[2] - 1.0}
+    return sorted(xs), sorted(ys)
+
+
+def _pick_holes(summary, edges, mode: str) -> list[dict]:
+    """ONE located hole per FACE seen in the view (Simón: every face that carries a feature gets its
+    feature — the spine's centre hole as well as the ear's), the view's top-left hole first. Identical
+    faces (mirrored ears) are filtered later by their dimension values."""
+    circles = [r for r in edges if r.get("t") == "circle" and "c" in r]
+    if not circles or mode == "none":
+        return []
+    bb = summary["bbox_mm"]
+    xs, ys = _face_regions(summary, edges)
+    tl = lambda c: (c["c"][0] - bb[0]) + (bb[3] - c["c"][1])
+    groups: dict = {}
+    for c in circles:
+        key = (sum(1 for x in xs if x < c["c"][0]), sum(1 for y in ys if y < c["c"][1]))
+        groups.setdefault(key, []).append(c)
+    picks = [min(cs, key=tl) for cs in groups.values()]
+    picks.sort(key=tl)
+    return picks
+
+
+def _dim_value_in(edges, d, scale) -> float | None:
+    """Value a linear/diameter dim will read, from the geometry (for duplicate filtering)."""
+    idx = {r["i"]: r for r in edges}
+    try:
+        if d["type"] == "diameter":
+            return round(idx[d["e1"]]["r"] * 2 / _IN, 4)
+        a, b = idx[d["e1"]], idx[d["e2"]]
+        pa = a["c"] if a["t"] == "circle" else a["m"]
+        line = b if b["t"] == "line" else a
+        other = pa if b["t"] == "line" else (b["c"] if b["t"] == "circle" else b["m"])
+        if abs(line["s"][0] - line["e"][0]) < 0.05:      # vertical line -> horizontal distance
+            return round(abs(line["s"][0] - other[0]) / scale / _IN, 4)
+        return round(abs(line["s"][1] - other[1]) / scale / _IN, 4)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _face_hole_dims(summary, edges, occupied: dict, thk_sheet, band, scale, base_hole="top_left") -> list[dict]:
+    """Hole dims for every face in a view: first hole as usual; further holes drop an X or Y that
+    repeats a value already placed (the centred spine hole shares the ear's .688) and put their Ø
+    level with the hole beside the view; a face whose (Ø, X, Y) all repeat is skipped (mirrored ear)."""
+    out = []
+    placed_x: list = []
+    placed_y: list = []
+    seen_faces: list = []
+    same = lambda a, b: a is not None and b is not None and abs(a - b) < 0.005   # 3-place display equality
+    first = True
+    for hole in _pick_holes(summary, edges, base_hole):
+        dims = _hole_dims(summary, edges, hole, dict(occupied), thk_sheet, band=band)
+        vals = {d["label"]: _dim_value_in(edges, d, scale) for d in dims}
+        sig = (vals.get("hole_dia"), vals.get("hole_x"), vals.get("hole_y"))
+        if any(all(same(a, b) for a, b in zip(sig, f)) for f in seen_faces):
+            continue          # a mirrored twin of a face already dimensioned (the second ear)
+        seen_faces.append(sig)
+        if first:
+            first = False
+            _hole_dims(summary, edges, hole, occupied, thk_sheet, band=band)   # record the bands actually used
+            out += dims
+            placed_x.append(vals.get("hole_x")); placed_y.append(vals.get("hole_y"))
+            continue
+        bb = summary["bbox_mm"]
+        cx, cy = hole["c"]
+        for d in dims:
+            v = vals.get(d["label"])
+            if d["label"] == "hole_x" and any(same(p, v) for p in placed_x):
+                continue
+            if d["label"] == "hole_y" and any(same(p, v) for p in placed_y):
+                continue
+            if d["label"] == "hole_dia":
+                # level with the hole, beside the view, on the side AWAY from the Y dims' band
+                right = not (occupied.get("right", 0) > 0) if occupied.get("left", 0) or occupied.get("right", 0) else cx >= (bb[0] + bb[2]) / 2
+                d = dict(d, text=[round((bb[2] + 30.0) if right else (bb[0] - 30.0), 1), round(cy, 1)])
+            if d["label"] == "hole_x":
+                placed_x.append(v)
+            if d["label"] == "hole_y":
+                placed_y.append(v)
+            out.append(d)
+    return out
+
+
 def _hole_dims(summary, edges, hole, occupied: dict, thk_sheet: float | None = None, band: float = INNER_OFF) -> list[dict]:
     """X + Y + Ø for one hole. Returns dims and records which sides got a dim in the `band`."""
     bb = summary["bbox_mm"]
@@ -727,13 +822,13 @@ def _envelope_dims(summary, occupied: dict, want_w=True, want_h=True) -> list[di
     env = summary["envelope_edges"]
     dims = []
     if want_w and env["left"] and env["right"]:
-        # envelope width above the view; a step further out when the hole X dim is already there
-        off = INNER_OFF + (OUTER_STEP if occupied.get("top", 0) else 0)
+        # envelope width above the view; one step further out for EVERY dimension row already there
+        off = INNER_OFF + OUTER_STEP * occupied.get("top", 0)
         y = bb[3] + off
         dims.append({"type": "linear", "e1": env["left"]["i"], "e2": env["right"]["i"], "text": [round((bb[0] + bb[2]) / 2, 1), round(y, 1)], "label": "envelope_w"})
     if want_h and env["top"] and env["bottom"]:
         side = "left"
-        off = INNER_OFF + (OUTER_STEP if occupied.get(side, 0) else 0)
+        off = INNER_OFF + OUTER_STEP * occupied.get(side, 0)
         x = bb[0] - off
         dims.append({"type": "linear", "e1": env["top"]["i"], "e2": env["bottom"]["i"], "text": [round(x, 1), round((bb[1] + bb[3]) / 2, 1)], "label": "envelope_h"})
     return dims
@@ -756,8 +851,17 @@ def _thickness_pair(edges, thk_sheet_mm, horizontal_lines: bool):
     return None if best is None else (best[1], best[2])
 
 
+def _real_arc(a) -> bool:
+    """True for an arc actually SEEN as an arc in the view. A bend arc whose axis lies in the view
+    plane projects edge-on to a straight segment (108689 edge/side views): its start and end differ
+    along one axis only, and a radius dimension on it renders as a bogus linear-looking (.039)."""
+    if a.get("t") != "arc" or "s" not in a or "e" not in a:
+        return False
+    return abs(a["s"][0] - a["e"][0]) > 0.25 and abs(a["s"][1] - a["e"][1]) > 0.25
+
+
 def _bend_arc(edges, thk_model_mm, bend_radius_in):
-    arcs = [r for r in edges if r.get("t") == "arc" and r.get("r")]
+    arcs = [r for r in edges if r.get("t") == "arc" and r.get("r") and _real_arc(r)]
     if not arcs:
         return None
     if bend_radius_in:
@@ -872,33 +976,33 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
     drawing = slip._active_drawing()
     report = {"status": "done", "views": {}}
 
-    # ---- base view
+    # ---- geometry of every view first: the (thk)/(R) view is decided before any dimension is placed
     g = _geom(base_view)
     summ, edges, scale = g["summary"], g["edges"], g["scale"] or 1.0
     thk_model_mm = thickness_in * _IN if thickness_in else None
     thk_sheet = thk_model_mm * scale if thk_model_mm else None
-    occupied: dict = {}
-    dims = []
-    hole = _pick_hole(summ, edges, base_hole)
-    if hole:
-        dims += _hole_dims(summ, edges, hole, occupied, thk_sheet)
-    dims += _envelope_dims(summ, occupied)
-    r = sb._add_dimensions(base_view, [{k: v for k, v in d.items() if k != "label"} for d in dims])
-    report["views"][base_view] = _compact(r, dims)
-
-    flange_vals: list = []
-
-    # Where do (thk) and (R) go? Simón (108716): on the view where a flange is seen EDGE-ON — the
-    # bottom (edge) view when it has a thickness pair + bend arc; else the side view.
     ge = _geom(edge_view) if edge_view else None
     gs = _geom(side_view) if side_view else None
+    flange_vals: list = []
+
+    # Where do (thk) and (R) go? Simón (108716): on the view where a flange is seen EDGE-ON next to a
+    # bend arc that is SEEN as an arc — the bottom (edge) view first, then the side view. When the bends
+    # are edge-on in both projections (108689 C-bracket: its arcs are only face-on in the plan view) the
+    # base view takes them, in a row BELOW the view (the envelope sits above).
+    def has_thk_and_arc(gg):
+        return bool(gg and thk_sheet and (_thickness_pair(gg["edges"], thk_sheet, False) or _thickness_pair(gg["edges"], thk_sheet, True))
+                    and _bend_arc(gg["edges"], thk_model_mm, bend_radius_in))
     thk_r_on = None
-    if ge and thk_sheet and (_thickness_pair(ge["edges"], thk_sheet, False) or _thickness_pair(ge["edges"], thk_sheet, True)) and _bend_arc(ge["edges"], thk_model_mm, bend_radius_in):
+    if has_thk_and_arc(ge):
         thk_r_on = edge_view
+    elif has_thk_and_arc(gs):
+        thk_r_on = side_view
+    elif has_thk_and_arc(g):
+        thk_r_on = base_view
     elif gs:
         thk_r_on = side_view
 
-    def thk_and_r(g, view_is_side: bool, prefer_right: bool = True) -> list[dict]:
+    def thk_and_r(g, view_is_side: bool, prefer_right: bool = True, below: bool = False) -> list[dict]:
         """(thk) across a flange seen edge-on + (R) leader on its bend arc, on the flange AWAY from
         the hole dims (Simón 108716: beside the 1.25 flange on the right). Both texts sit in the
         same row as the hole dims, ROW_OFF above the view: (thk) a full band (25 mm) outside the flange so
@@ -908,21 +1012,27 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
         bb_ = summ_["bbox_mm"]
         mid_x = (bb_[0] + bb_[2]) / 2
         pairs = _thk_pairs(edges_, thk_sheet, horizontal_lines=False)   # vertical pairs -> horizontal dim
-        pairs = sorted(pairs, key=lambda p: (p[0] < mid_x) if prefer_right else (p[0] > mid_x))  # preferred side first
+        row = (bb_[1] - ROW_OFF) if below else (bb_[3] + ROW_OFF)
+        # preferred side first, then the pair whose span ends nearest the text row (short extension lines)
+        pairs = sorted(pairs, key=lambda p: ((p[0] < mid_x) if prefer_right else (p[0] > mid_x),
+                                             (p[3] - bb_[1]) if below else (bb_[3] - p[4])))
         pair = (pairs[0][1], pairs[0][2], pairs[0][0]) if pairs else None
         if pair:
             xa = pair[2]
             right = xa > mid_x
-            row = bb_[3] + ROW_OFF
             out.append({"type": "linear", "e1": pair[0], "e2": pair[1],
                         "text": [round(xa + (25 if right else -25), 1), round(row, 1)], "reference": True, "label": "thk"})
             # the bend arc of THIS flange: nearest matching arc
-            arcs = [r for r in edges_ if r.get("t") == "arc" and r.get("r")]
+            arcs = [r for r in edges_ if r.get("t") == "arc" and r.get("r") and _real_arc(r)]
             target = (bend_radius_in * _IN) if bend_radius_in else None
             good = [a for a in arcs if (target and abs(a["r"] - target) < 0.08 * target + 0.05)
                     or any(abs(b["r"] - (a["r"] + thk_model_mm)) < 0.15 for b in arcs)]
             near = [a for a in good if abs(a.get("m", a.get("c"))[0] - xa) < 4 * thk_sheet + 2]
-            arc = min(near, key=lambda a: a["r"]) if near else None
+            # the inner arc of this flange's bend, on the corner nearest the text row
+            if near:
+                rmin = min(a["r"] for a in near)
+                near = [a for a in near if a["r"] < rmin + 0.15]
+            arc = min(near, key=lambda a: abs(a.get("m", a.get("c"))[1] - row)) if near else None
             if arc:
                 am = arc.get("m", arc.get("c"))
                 out.append({"type": "radius", "e1": arc["i"], "text": [round(am[0] + (-42 if right else 42), 1), round(row, 1)], "reference": True, "label": "bend_r"})
@@ -941,6 +1051,19 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
             out.append({"type": "radius", "e1": arc["i"], "text": [round(ax_ + toward, 1), round(bb_[3] + 6.0, 1)], "reference": True, "label": "bend_r"})
         return out
 
+    # ---- base view
+    occupied: dict = {}
+    dims = []
+    hole = _pick_hole(summ, edges, base_hole)
+    if hole:
+        dims += _face_hole_dims(summ, edges, occupied, thk_sheet, INNER_OFF, scale, base_hole)
+    dims += _envelope_dims(summ, occupied)
+    if thk_r_on == base_view:
+        hole_left = hole is not None and hole["c"][0] < (summ["bbox_mm"][0] + summ["bbox_mm"][2]) / 2
+        dims += thk_and_r(g, False, prefer_right=(hole_left or hole is None), below=True)
+    r = sb._add_dimensions(base_view, [{k: v for k, v in d.items() if k != "label"} for d in dims])
+    report["views"][base_view] = _compact(r, dims)
+
     # ---- edge view (bottom projection)
     if edge_view and ge:
         summ, edges = ge["summary"], ge["edges"]
@@ -956,7 +1079,7 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
             occ: dict = {}
             if circles:
                 hole = _pick_hole(summ, edges, "top_left")
-                dims += _hole_dims(summ, edges, hole, occ, thk_sheet, band=PROJ_BAND)
+                dims += _face_hole_dims(summ, edges, occ, thk_sheet, PROJ_BAND, scale)
             if thk_sheet:
                 # flanges seen edge-on here (plate horizontal): each distinct length once
                 dims += _flange_dims(edges, summ, thk_sheet, scale, False, flange_vals, "left", occ)
@@ -977,9 +1100,9 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
         dims = []
         circles = [e for e in edges if e.get("t") == "circle"]
         occ = {}
-        if circles:   # the side flange's FACE is visible here: one located hole (Simón, 108716)
+        if circles:   # every FACE visible here gets its one located hole (Simón, 108716 / 108689)
             hole = _pick_hole(summ, edges, "top_left")
-            dims += _hole_dims(summ, edges, hole, occ, thk_sheet, band=PROJ_BAND)
+            dims += _face_hole_dims(summ, edges, occ, thk_sheet, PROJ_BAND, scale)
         # flange height = horizontal extent (left/right envelope), BELOW the view (outer)
         if env["left"] and env["right"]:
             w_in = summ.get("width_in") or 0.0
@@ -1181,10 +1304,13 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
     bb = summ["bbox_mm"]
     env = summ["envelope_edges"]
 
-    # bend lines -> edge-to-bend-line dims (nearest parallel envelope edge), then overall
+    # bend lines -> edge-to-bend-line dims (nearest parallel envelope edge), then overall.
+    # Several bend lines measured from the SAME edge (108689: 1.199 and 5.534 from the left end) are
+    # stacked outward, shortest span innermost, one OUTER_STEP apart — never on one shared row.
     bl = sv._flat_bend_lines(fname).get("bend_lines", [])
     bend_dims, occupied = [], {}
     seen: set = set()   # (orientation, side, distance_in rounded): equal bend distances dimensioned ONCE
+    groups: dict = {}   # (orientation, side) -> [(span, ref_i, bend_i, m)]
     for b in bl:
         m = b["m"]
         if b["orientation"] == "horizontal":
@@ -1197,10 +1323,7 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
                 if key in seen:
                     continue
                 seen.add(key)
-                # short span: text ALONG the dimension, outside the span (never on its own arrows)
-                ty = (m[1] + edge_y) / 2 if span >= 22 else (edge_y + 12 if near_top else edge_y - 12)
-                bend_dims.append({"e_ref": ref["i"], "bend": b["i"], "text": [round(bb[0] - INNER_OFF, 1), round(ty, 1)]})
-                occupied["left"] = occupied.get("left", 0) + 1
+                groups.setdefault(("h", near_top), []).append((span, ref["i"], b["i"], m, edge_y))
         else:
             near_left = (m[0] - bb[0]) <= (bb[2] - m[0])
             ref = env["left"] if near_left else env["right"]
@@ -1211,9 +1334,21 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
                 if key in seen:
                     continue
                 seen.add(key)
-                tx = (m[0] + edge_x) / 2 if span >= 22 else (edge_x - 14 if near_left else edge_x + 14)
-                bend_dims.append({"e_ref": ref["i"], "bend": b["i"], "text": [round(tx, 1), round(bb[3] + INNER_OFF, 1)]})
-                occupied["top"] = occupied.get("top", 0) + 1
+                groups.setdefault(("v", near_left), []).append((span, ref["i"], b["i"], m, edge_x))
+    for (orient, side), items in groups.items():
+        items.sort(key=lambda t: t[0])
+        for n, (span, ref_i, bend_i, m, edge) in enumerate(items):
+            off = INNER_OFF + OUTER_STEP * n
+            if orient == "h":
+                # vertical dimension on the LEFT of the view; short span: text ALONG the dim, outside the span
+                ty = (m[1] + edge) / 2 if span >= SHORT_V else (edge + 12 if side else edge - 12)
+                bend_dims.append({"e_ref": ref_i, "bend": bend_i, "text": [round(bb[0] - off, 1), round(ty, 1)]})
+                occupied["left"] = max(occupied.get("left", 0), n + 1)
+            else:
+                # horizontal dimension ABOVE the view
+                tx = (m[0] + edge) / 2 if span >= SHORT_H else (edge - 14 if side else edge + 14)
+                bend_dims.append({"e_ref": ref_i, "bend": bend_i, "text": [round(tx, 1), round(bb[3] + off, 1)]})
+                occupied["top"] = max(occupied.get("top", 0), n + 1)
     rb = sv._add_bend_dimensions(fname, bend_dims) if bend_dims else {"dimensions": []}
     # edge indices can change after annotations are added: re-read before the envelope dims
     summ = _geom(fname)["summary"]
