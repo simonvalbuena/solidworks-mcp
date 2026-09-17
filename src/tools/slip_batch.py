@@ -114,6 +114,7 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         notes_sheet: str = "Sheet1",
         export_pdf: bool = False,
         keep_bend_fragment: bool = False,
+        keep_finish_color: bool = False,
     ) -> str:
         """One-call R00 finish for a Slip part drawing: every view Hidden Lines Removed with
         tangent edges REMOVED, the iso view (iso_view) tangent edges VISIBLE, delete Sheet2
@@ -121,12 +122,12 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         clean the notes block: bend-radius fragment -> dropped (flat part) or replaced by the
         literal bend_radius_text (e.g. "0.102" -> "(0.102 IN BEND RADIUS)" when the BEND_RADIUS
         property is blank) or KEPT as the property link when keep_bend_fragment=True (a bent part
-        whose BEND_RADIUS property is filled), FINISH_COLOR dropped (or FINISH line replaced by
-        finish_text), MASK and rev-flag paragraphs removed, every note ending with a period.
+        whose BEND_RADIUS property is filled), FINISH_COLOR dropped (kept as a second link when
+        keep_finish_color=True — a finished part; or the FINISH line replaced by finish_text), MASK and rev-flag paragraphs removed, every note ending with a period.
         export_pdf=True also saves and writes <PN>-<REV>.pdf beside the drawing. Tolerant of
         already-clean input."""
         return await slip._run(sw, "finish_slip_r00", _finish_slip_r00, iso_view, finish_text, delete_sheet2,
-                               bend_radius_text, notes_sheet, export_pdf, keep_bend_fragment)
+                               bend_radius_text, notes_sheet, export_pdf, keep_bend_fragment, keep_finish_color)
 
 
 # --------------------------------------------------------------------------- geometry
@@ -267,6 +268,7 @@ def _read_edge_once(edge, index: int) -> dict:
                 rec["type"] = "circle" if "start" not in rec else "arc"
                 cp = curve.CircleParams
                 rec["center"] = (float(cp[0]), float(cp[1]), float(cp[2]))
+                rec["axis"] = (float(cp[3]), float(cp[4]), float(cp[5]))
                 rec["radius"] = float(cp[6])
         except Exception:  # noqa: BLE001
             pass
@@ -309,6 +311,10 @@ def _apply_transform(to_sheet, edges, edges_info) -> list[dict]:
             rec["len"] = round(math.dist(rec["s"], rec["e"]), 3)
         if radius is not None:
             rec["r"] = round(radius * _M_TO_MM, 3)
+        if info.get("axis") is not None:
+            rec["_axis"] = info["axis"]
+        if start is not None and end is not None and info["type"] == "line":
+            rec["_dir"] = (end[0] - start[0], end[1] - start[1], end[2] - start[2])
         mp = info.get("midpoint")
         if mp:
             rec["model_mid"] = [mp["x"], mp["y"]]
@@ -406,7 +412,9 @@ def _summarize(edges: list[dict]) -> dict:
         h = abs(top["s"][1] - bottom["s"][1])
         summary["height_sheet_mm"] = round(h, 2)
 
-    circles = [r for r in edges if r["t"] == "circle" and "c" in r and "r" in r]
+    # only face-on circles are features of THIS view; tilted ones (ellipses) are listed apart
+    circles = [r for r in edges if r["t"] == "circle" and "c" in r and "r" in r and r.get("tilt", 0.0) <= FACE_ON_TILT]
+    summary["foreshortened_circles"] = [r["i"] for r in edges if r["t"] == "circle" and r.get("tilt", 0.0) > FACE_ON_TILT]
     groups: dict[float, list] = {}
     for c in circles:
         groups.setdefault(round(c["r"], 2), []).append(c)
@@ -419,6 +427,41 @@ def _summarize(edges: list[dict]) -> dict:
                              "all": [{"i": c["i"], "c": c["c"]} for c in items]})
     summary["circles"] = circ_summary
     return summary
+
+
+FACE_ON_TILT = 0.05   # sin(angle between the circle axis and the viewing direction) — 0 = face-on
+
+
+def _tag_tilt(recs) -> None:
+    """Circles/arcs: `tilt` = sin of the angle between the hole axis and the view direction (0 =
+    seen face-on, 0.707 = on a 45° face). A tilted circle draws as an ellipse: its projected size and
+    along-slope position are not the feature's (108699: a Ø.875 on the 45° face came out as an
+    ellipse "TRUE R.438" in the plan view) — dimension such a hole only in its normal view."""
+    arr = (_TRANSFORM_DEBUG.get("array") or [])
+    column = _TRANSFORM_DEBUG.get("convention") == "column(R*p)"
+    m = arr[0:9] if len(arr) >= 9 else None
+
+    def view_xyz(a):
+        if column:
+            return (a[0] * m[0] + a[1] * m[1] + a[2] * m[2], a[0] * m[3] + a[1] * m[4] + a[2] * m[5], a[0] * m[6] + a[1] * m[7] + a[2] * m[8])
+        return (a[0] * m[0] + a[1] * m[3] + a[2] * m[6], a[0] * m[1] + a[1] * m[4] + a[2] * m[7], a[0] * m[2] + a[1] * m[5] + a[2] * m[8])
+
+    for r in recs:
+        a = r.pop("_axis", None)
+        d = r.pop("_dir", None)
+        if m is None:
+            continue
+        if a is not None:
+            x, y, _ = view_xyz(a)
+            n = math.hypot(a[0], a[1], a[2]) or 1.0
+            r["tilt"] = round(min(1.0, math.hypot(x, y) / n), 3)
+        if d is not None:
+            # lines: `dz` = |sin| of the angle between the edge and the sheet plane (0 = lies in the view
+            # plane). A cut-out whose four edges all have dz≈0 is seen face-on; one on an inclined face
+            # has two edges climbing out of the plane (108706 edge view: the FACE A squares).
+            n = math.hypot(d[0], d[1], d[2]) or 1.0
+            _, _, z = view_xyz(d)
+            r["dz"] = round(min(1.0, abs(z) / n), 3)
 
 
 def _view_geometry(view_name, include_edges: bool) -> dict:
@@ -436,6 +479,7 @@ def _view_geometry(view_name, include_edges: bool) -> dict:
         edges = _get_view_edges(view_obj)
         edges_info = _read_edges_once(edges)   # single COM pass; transforms reuse the cache
         sheet_edges = _sheet_edges(app, view_obj, edges, edges_info)
+        _tag_tilt(sheet_edges)
         scale = _view_scale(view_obj)
         summ = _summarize(sheet_edges)
         if scale:
@@ -866,6 +910,16 @@ def _add_dimensions(view_name: str, dims: list[dict]) -> dict:
                 disp.SetPrecision3(DIM_PRECISION, SW_PRECISION_UNCHANGED, DIM_PRECISION, SW_PRECISION_UNCHANGED)
             except Exception:  # noqa: BLE001
                 pass
+            if d.get("arc_max"):
+                # line <-> arc: measure to the arc's far tangent point (swArcConditionMax = 2), not its centre
+                ok_arc = False
+                for idx in (1, 2):
+                    try:
+                        ok_arc = bool(disp.SetArcEndCondition(idx, 2)) or ok_arc
+                    except Exception as ex:  # noqa: BLE001
+                        logger.info("SetArcEndCondition(%s): %s", idx, ex)
+                if ok_arc:
+                    slip._rebuild(drawing)
             entry = {"n": n, "type": kind}
             info = slip._dim_info(disp)
             entry["name"] = info.get("name")
@@ -910,7 +964,7 @@ def _find_notes_block(drawing):
 
 
 def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool, bend_radius_text=None,
-                     notes_sheet="Sheet1", export_pdf=False, keep_bend_fragment=False) -> dict:
+                     notes_sheet="Sheet1", export_pdf=False, keep_bend_fragment=False, keep_finish_color=False) -> dict:
     drawing = slip._active_drawing()
     report: dict = {"status": "done", "steps": []}
     # the notes block lives on Sheet1; the flat-pattern step leaves Sheet2 active
@@ -962,13 +1016,16 @@ def _finish_slip_r00(iso_view, finish_text, delete_sheet2: bool, bend_radius_tex
         elif frag in src:
             src = src.replace(frag, "."); edits.append("bend_radius_fragment")
         # Every note ends with a period (Simon, 2026-09-09): the template's FINISH line has none.
-        fin_lit = (f"FINISH: {finish_text.rstrip('.')}." if finish_text else 'FINISH: $PRPSHEET:"FINISH".')
+        # a finished part keeps its colour link ("FINISH: POWDER COAT, BLACK, POLY PEEL GLOSS, TCI 9313-9000." —
+        # 108699); only an unfinished one drops it (never "NONE, NONE")
+        fin_lit = (f"FINISH: {finish_text.rstrip('.')}." if finish_text
+                   else ('FINISH: $PRPSHEET:"FINISH", $PRPSHEET:"FINISH_COLOR".' if keep_finish_color else 'FINISH: $PRPSHEET:"FINISH".'))
         for fin in ('FINISH: $PRPSHEET:"FINISH", $PRPSHEET:"FINISH_COLOR".',
                     'FINISH: $PRPSHEET:"FINISH", $PRPSHEET:"FINISH_COLOR"',
                     'FINISH: $PRPSHEET:"FINISH".', 'FINISH: $PRPSHEET:"FINISH"'):
             if fin in src:
                 src = src.replace(fin, fin_lit)
-                edits.append(f"finish_literal:{finish_text}." if finish_text else "finish_color_dropped+period")
+                edits.append(f"finish_literal:{finish_text}." if finish_text else ("finish_color_kept+period" if keep_finish_color else "finish_color_dropped+period"))
                 break
         # (FINISH literal lines that were previously written without a period get one)
         import re as _re
