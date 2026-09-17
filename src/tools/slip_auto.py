@@ -187,7 +187,10 @@ async def _make_slip_drawing(sw, model_path, base_view, edge_views, scale, save_
         _write_report(save_dir, pn, rep)
         return json.dumps(rep, ensure_ascii=False)
     save_path = os.path.join(save_dir, f"{pn}.SLDDRW")
-    lay = await stage("layout", _layout_slip_part, model_path, base_view, edge_views, scale, save_path, 0.0, True)
+    # layout saves once (first SaveAs): the title block's $PRP: fields are filled from the model by a
+    # save-time step that only shows up on the NEXT save — with the early save, the export's save is
+    # that next one and the PDF carries REV / EOR / dates (108706 run 2: single save -> "F. LAST", "-")
+    lay = await stage("layout", _layout_slip_part, model_path, base_view, edge_views, scale, save_path, 0.0, True, brief)
     if lay.get("status") != "done":
         rep["status"] = "partial"; rep["seconds"] = round(time.time() - t0, 1)
         _write_report(save_dir, pn, rep)
@@ -207,6 +210,14 @@ async def _make_slip_drawing(sw, model_path, base_view, edge_views, scale, save_
             if d.get("label") == "bend_r" and d.get("value"):
                 measured_r = d["value"]
     bent = bool(brief.get("bent"))
+    incl = dims.pop("inclined", None) or []
+    if incl:
+        # Simón's FACE A convention for a non-90° flange: angle + leader on the profile, normal view + its feature
+        s_ = lay.get("scale") or 1.0
+        fa = await stage("face_a", _face_a_stage, model_path, incl[0]["view"], roles.get("base"), incl[0], s_, thk)
+        if fa.get("status") != "done":
+            rep["status"] = "partial"
+        dims["inclined"] = [{k: v for k, v in i.items() if k != "geom"} for i in incl]   # the profile geometry stays out of the report
     if bent:
         flat = await stage("flat_sheet", _slip_flat_sheet, model_path, roles.get("base"), None, "Sheet2", 431.8, 279.4, False)
         if flat.get("status") != "done":
@@ -225,7 +236,8 @@ async def _make_slip_drawing(sw, model_path, base_view, edge_views, scale, save_
     if fin.get("status") != "done":
         rep["status"] = "partial"
     if export:
-        ex = await stage("export", _export_slip_pdf, None, True, True)
+        rev = (brief.get("props") or {}).get("REVISION") or None
+        ex = await stage("export", _export_slip_pdf, None, True, False, save_path, rev)
         if ex.get("status") != "done":
             rep["status"] = "partial"
     rep["views"] = roles
@@ -475,6 +487,20 @@ def _set_pos(view_obj, x_mm, y_mm):
     ole.Invoke(dispid, 0, slip.DISPATCH_PROPERTYPUT, False, variant)
 
 
+def _display(view_obj, tangent="removed"):
+    """HLR + tangent-edge style on ONE view, without a rebuild (the caller's next rebuild applies it).
+    The dimension rules were tuned on HLR / tangent-removed geometry — a view read in its inserted
+    hidden-lines-visible style shows extra edges (108706 run 2: a bogus .435 flange height)."""
+    try:
+        view_obj.SetDisplayMode3(False, slip.DISPLAY_MODES["hidden_lines_removed"], False, False)
+    except Exception as ex:  # noqa: BLE001
+        logger.info("SetDisplayMode3: %s", ex)
+    try:
+        view_obj.SetDisplayTangentEdges2(slip.TANGENT_EDGES[tangent])
+    except Exception as ex:  # noqa: BLE001
+        logger.info("SetDisplayTangentEdges2: %s", ex)
+
+
 def _insert_model_view(drawing, model_path, orient_key, x_mm, y_mm):
     before = {n for n, _ in _get_drawing_views(drawing, None)}
     name_sw = ORIENT.get(orient_key, orient_key)
@@ -506,16 +532,19 @@ def _save_drawing_as(drawing, path: str) -> dict:
     return {"saved": None, "error": f"all SaveAs variants failed (errors={_try(lambda: errs.value)})"}
 
 
-def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotate_base_deg, create_new=False) -> dict:
+def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotate_base_deg, create_new=False, brief=None) -> dict:
     app = SWConnection.get_instance().get_app()
     # the drawing FIRST (opening/activating the part changes ActiveDoc)
     drawing, tpl = _ensure_drawing(app, create_new)
-    dtitle = _try(lambda: str(_val(drawing, "GetTitle")))
-    part = _open_part(app, model_path)
-    brief = _brief_dict(app, part, model_path)
-    if dtitle:
-        _try(lambda: sv._activate_doc(app, dtitle))
-    drawing = slip._active_drawing()
+    if brief is None:
+        # standalone tool use: open the part and read it here (the pipeline passes its brief in —
+        # the feature-tree walk and the two document activations are not repeated)
+        dtitle = _try(lambda: str(_val(drawing, "GetTitle")))
+        part = _open_part(app, model_path)
+        brief = _brief_dict(app, part, model_path)
+        if dtitle:
+            _try(lambda: sv._activate_doc(app, dtitle))
+        drawing = slip._active_drawing()
 
     base_key = brief["suggest"]["base_view"] if base_view in (None, "", "auto") else base_view.lower()
     ev = brief["suggest"]["edge_views"] if edge_views in (None, "", "auto") else edge_views
@@ -523,6 +552,7 @@ def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotat
 
     # 1. base view at 1:1 to measure it
     bname, bview = _insert_model_view(drawing, model_path, base_key, STACK_CX, STACK_CY)
+    _display(bview)
     _set_scale(bview, 1.0)
     if rotate_base_deg:
         try:
@@ -550,10 +580,9 @@ def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotat
     else:
         s = float(scale)
     _set_scale(bview, s)
-    slip._rebuild(drawing)
     ws, hs, ds = w1 * s, h1 * s, d1 * s
 
-    # 2. positions: stack (base over bottom projection) centred at STACK_CY
+    # 2. positions: stack (base over bottom projection) centred at STACK_CY (one rebuild for scale + position)
     stack_h = hs + (GAP_V + ds if "bottom" in ev_list else 0.0)
     base_cy = STACK_CY + stack_h / 2 - hs / 2
     base_cx = STACK_CX
@@ -574,33 +603,30 @@ def _layout_slip_part(model_path, base_view, edge_views, scale, save_path, rotat
         else:
             continue
         try:
-            r = sv._project_view(bname, e, cx, cy)
+            r = sv._project_view(bname, e, cx, cy, False)
+            _display(_view_by_name(drawing, r.get("name")))
             views.append({"name": r.get("name"), "role": {"bottom": "edge", "top": "edge", "right": "side", "left": "side"}[e],
                           "direction": e})
         except Exception as ex:  # noqa: BLE001
             views.append({"role": e, "error": str(ex)})
+    slip._rebuild(drawing)   # one rebuild for all projections
 
     # 4. iso (small, lower-right; keep clear of the side view and the title block)
     iso_scale = _std_scale(max(0.125, s / 3.0))
     right_edge = max([(_outline(_view_by_name(drawing, v["name"])) or [0, 0, 0, 0])[2] for v in views if v.get("name")] + [0])
     iso_x = max(ISO_POS[0], min(800.0, right_edge + 75.0))
-    iname, iview = _insert_model_view(drawing, model_path, "iso", iso_x, ISO_POS[1])
+    # keep it above the title block (starts at y≈120 for x>580) without a rebuild+outline round trip:
+    # the iso's half-height is at most half the part's bounding-box diagonal at the iso scale
+    half_h = 0.5 * math.sqrt(sum((v * _IN) ** 2 for v in sz.values())) * iso_scale + margin
+    iso_y = max(ISO_POS[1], 128.0 + half_h)
+    iname, iview = _insert_model_view(drawing, model_path, "iso", iso_x, iso_y)
+    _display(iview, "visible")
     _set_scale(iview, iso_scale)
-    slip._rebuild(drawing)
-    io = _outline(iview)
-    if io and io[1] < 128.0:   # title block starts at y≈120 for x>580
-        _set_pos(iview, iso_x, ISO_POS[1] + (128.0 - io[1]))
     views.append({"name": iname, "role": "iso", "scale": iso_scale})
 
-    # 5. display
-    _try(lambda: slip._set_view_display(None, "hidden_lines_removed", "removed"))
-    _try(lambda: slip._set_view_display(iname, "hidden_lines_removed", "visible"))
-    slip._rebuild(drawing)
-
-    # 6. save
-    pn = os.path.splitext(os.path.basename(model_path))[0]
-    path = save_path or os.path.join(r"C:\Drawings", f"{pn}.SLDDRW")
-    saved = _save_drawing_as(drawing, path)
+    # 5. display styles were set per view at creation (finish re-applies them once more)
+    # 6. save when a path is given (the pipeline's first SaveAs; export saves again)
+    saved = _save_drawing_as(drawing, save_path) if save_path else {"saved": None, "deferred": True}
 
     for v in views:
         if v.get("name"):
@@ -865,10 +891,11 @@ def _bend_arc(edges, thk_model_mm, bend_radius_in):
     if not arcs:
         return None
     if bend_radius_in:
+        # the bend radius is KNOWN: only an arc of that radius is a bend arc — never fall back to a
+        # corner fillet that happens to pair with something (108706: a "(TRUE R.125)" on a corner round)
         target = bend_radius_in * _IN
         near = [a for a in arcs if abs(a["r"] - target) < 0.08 * target + 0.05]
-        if near:
-            return near[0]
+        return near[0] if near else None
     # inner/outer pair: outer r = inner r + thickness
     if thk_model_mm:
         for a in arcs:
@@ -970,6 +997,282 @@ def _flange_dims(edges, summary, thk_sheet_mm, scale, plate_vertical: bool, alre
         occupied[side] = occupied.get(side, 0) + 1
         dims.append({"type": "linear", "e1": outer_line["i"], "e2": i_tip, "text": text, "label": f"flange_{k}"})
     return dims
+
+
+
+# --------------------------------------------------------------------------- FACE A (inclined flanges)
+
+def _inclined_pairs(g, thk_sheet) -> list[dict]:
+    """Flanges at a non-90° bend, seen edge-on in this view: a pair of parallel lines one thickness
+    apart that are neither horizontal nor vertical. Each entry: outer/inner line, direction u, outward
+    normal n (sheet, unit), angle, length, the bend end and tip end of the outer line."""
+    if not thk_sheet:
+        return []
+    bb = g["summary"]["bbox_mm"]
+    cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    diag = []
+    for r in g["edges"]:
+        if r.get("t") != "line" or "s" not in r:
+            continue
+        dx, dy = r["e"][0] - r["s"][0], r["e"][1] - r["s"][1]
+        L = math.hypot(dx, dy)
+        if L < 3 * thk_sheet:
+            continue
+        ang = math.degrees(math.atan2(dy, dx)) % 180.0
+        if min(ang, abs(ang - 90.0), abs(ang - 180.0)) < 3.0:
+            continue
+        diag.append((r, ang, L, (dx / L, dy / L)))
+    out, used = [], set()
+    for i, (a, anga, La, ua) in enumerate(diag):
+        for j, (b, angb, Lb, ub) in enumerate(diag):
+            if j <= i or i in used or j in used:
+                continue
+            if abs(anga - angb) > 2.0 or abs(La - Lb) > max(2.0, 0.3 * La):
+                continue
+            n = (-ua[1], ua[0])
+            d = abs((b["m"][0] - a["m"][0]) * n[0] + (b["m"][1] - a["m"][1]) * n[1])
+            if abs(d - thk_sheet) > max(0.35, 0.06 * thk_sheet):
+                continue
+            used |= {i, j}
+            mid = ((a["m"][0] + b["m"][0]) / 2, (a["m"][1] + b["m"][1]) / 2)
+            if (mid[0] - cx) * n[0] + (mid[1] - cy) * n[1] < 0:
+                n = (-n[0], -n[1])
+            outer, inner = (a, b) if (a["m"][0] * n[0] + a["m"][1] * n[1]) > (b["m"][0] * n[0] + b["m"][1] * n[1]) else (b, a)
+            out.append({"outer": outer, "inner": inner, "u": ua, "n": n, "angle_deg": round(anga, 2), "len": La, "mid": mid})
+    return out
+
+
+def _angle_partner(g, inc, thk_sheet):
+    """The axis-aligned line whose angle to the inclined flange SolidWorks will report as the ACUTE
+    bend angle (the wedge is chosen by the two selection midpoints — Simón 108544: vertical leg +
+    diagonal → 45°, top flange + diagonal → 135°). Returns (line, vertex, text_point) or None."""
+    o = inc["outer"]
+    u = inc["u"]
+    best = None
+    for r in g["edges"]:
+        if r.get("t") != "line" or "s" not in r or r["i"] in (inc["outer"]["i"], inc["inner"]["i"]):
+            continue
+        dx, dy = r["e"][0] - r["s"][0], r["e"][1] - r["s"][1]
+        L = math.hypot(dx, dy)
+        if L < 3 * thk_sheet or (abs(dx) > 0.05 and abs(dy) > 0.05):
+            continue                                   # only horizontal / vertical partners
+        v = (dx / L, dy / L)
+        den = u[0] * v[1] - u[1] * v[0]
+        if abs(den) < 1e-6:
+            continue
+        # intersection of the two infinite lines: o.m + t*u = r.m + k*v
+        wx, wy = r["m"][0] - o["m"][0], r["m"][1] - o["m"][1]
+        t = (wx * v[1] - wy * v[0]) / den
+        vx, vy = o["m"][0] + t * u[0], o["m"][1] + t * u[1]
+        a1 = (o["m"][0] - vx, o["m"][1] - vy)
+        a2 = (r["m"][0] - vx, r["m"][1] - vy)
+        n1, n2 = math.hypot(*a1), math.hypot(*a2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            continue
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, (a1[0] * a2[0] + a1[1] * a2[1]) / (n1 * n2)))))
+        if ang >= 89.0:
+            continue                                   # SolidWorks would show the obtuse wedge
+        # nearest approach between the partner and the flange (adjacent face preferred)
+        gap = min(math.hypot(p[0] - q[0], p[1] - q[1]) for p in (o["s"], o["e"]) for q in (r["s"], r["e"]))
+        bis = (a1[0] / n1 + a2[0] / n2, a1[1] / n1 + a2[1] / n2)
+        nb = math.hypot(*bis) or 1.0
+        # text on the wedge bisector, past the flange tip (Simón 108706: the 45° sits clear of the part,
+        # not squeezed between the leg and the flange); the bisector keeps SolidWorks on the same wedge
+        tip_d = max(math.hypot(p[0] - vx, p[1] - vy) for p in (o["s"], o["e"]))
+        d = tip_d + ROW_OFF
+        text = (vx + bis[0] / nb * d, vy + bis[1] / nb * d)
+        cand = (gap, r, (vx, vy), text, ang)
+        if best is None or cand[0] < best[0]:
+            best = cand
+    return None if best is None else (best[1], best[2], best[3], best[4])
+
+
+def _sheet_normal_to_model(g, n_sheet) -> list[float]:
+    """Sheet-plane unit vector -> model coordinates through the view's ModelToViewTransform
+    (row-vector convention p_sheet = p_model · R  =>  p_model = p_sheet · Rᵀ)."""
+    arr = (g.get("transform_debug") or {}).get("array") or []
+    if len(arr) < 9:
+        raise SWError("view transform unavailable for the FACE A normal")
+    R = [[float(arr[3 * i + j]) for j in range(3)] for i in range(3)]
+    nx, ny = n_sheet
+    n = [nx * R[i][0] + ny * R[i][1] for i in range(3)]
+    L = math.hypot(*n) or 1.0
+    return [round(c / L, 6) for c in n]
+
+
+def _rect_features(edges, region):
+    """Small closed axis-aligned rectangles (square cut-outs) inside region [x0,y0,x1,y1]:
+    returns [{x0,y0,x1,y1, left,right,top,bottom (edge indices)}]."""
+    x0, y0, x1, y1 = region
+    hs = [r for r in _lines(edges, True) if r.get("len", 0) <= 40 and x0 <= r["m"][0] <= x1 and y0 <= r["m"][1] <= y1]
+    vs = [r for r in _lines(edges, False) if r.get("len", 0) <= 40 and x0 <= r["m"][0] <= x1 and y0 <= r["m"][1] <= y1]
+    out = []
+    for a in hs:
+        for b in hs:
+            if a["i"] >= b["i"] or abs(a["len"] - b["len"]) > 0.3:
+                continue
+            lo, hi = sorted([a["s"][0], a["e"][0]])
+            lo2, hi2 = sorted([b["s"][0], b["e"][0]])
+            if abs(lo - lo2) > 0.3 or abs(hi - hi2) > 0.3:
+                continue
+            ya, yb = sorted([a["s"][1], b["s"][1]])
+            left = [v for v in vs if abs(v["s"][0] - lo) < 0.3 and min(v["s"][1], v["e"][1]) <= ya + 0.3 and max(v["s"][1], v["e"][1]) >= yb - 0.3]
+            right = [v for v in vs if abs(v["s"][0] - hi) < 0.3 and min(v["s"][1], v["e"][1]) <= ya + 0.3 and max(v["s"][1], v["e"][1]) >= yb - 0.3]
+            if left and right:
+                top, bottom = (a, b) if a["s"][1] > b["s"][1] else (b, a)
+                out.append({"x0": lo, "y0": ya, "x1": hi, "y1": yb, "left": left[0]["i"], "right": right[0]["i"], "top": top["i"], "bottom": bottom["i"]})
+    return out
+
+
+def _face_a_stage(model_path, profile_view, base_view, inclined: dict, scale, thickness_in) -> dict:
+    """Simón's FACE A convention, automated: bend angle + "FACE A" leader on the profile view, a
+    `Current Model View` normal to the inclined face placed clear of the other views and labelled,
+    and the face's ONE feature (hole or square cut-out) located from the flange end and the tip edge."""
+    drawing = slip._active_drawing()
+    rep: dict = {"status": "done", "profile": profile_view}
+    thk_sheet = (thickness_in * _IN * scale) if thickness_in else None
+    g = (inclined or {}).get("geom") or _geom(profile_view)
+    incs = _inclined_pairs(g, thk_sheet)
+    if not incs:
+        return {"status": "done", "skipped": "no inclined flange in the profile view"}
+    inc = max(incs, key=lambda k: k["len"])
+    bb = g["summary"]["bbox_mm"]
+    dims = []
+    # 1. bend angle (acute wedge by the midpoint rule) + FACE A leader note on the outer face line
+    partner = _angle_partner(g, inc, thk_sheet)
+    if partner:
+        line, vertex, text, ang = partner
+        dims.append({"type": "linear", "e1": line["i"], "e2": inc["outer"]["i"], "text": [round(text[0], 1), round(text[1], 1)], "label": "bend_angle"})
+        rep["bend_angle_deg"] = round(ang, 1)
+        # tip end = the outer line's end farther from the partner
+        o = inc["outer"]
+        far = max((o["s"], o["e"]), key=lambda pnt: min(math.hypot(pnt[0] - q[0], pnt[1] - q[1]) for q in (line["s"], line["e"])))
+    else:
+        o = inc["outer"]
+        far = o["e"]
+    if dims:
+        r = sb._add_dimensions(profile_view, [{k: v for k, v in d.items() if k != "label"} for d in dims])
+        rep["profile_dims"] = _compact(r, dims)
+    n = inc["n"]
+    note_xy = (o["m"][0] + n[0] * 22.0 + (far[0] - o["m"][0]) * 0.6, o["m"][1] + n[1] * 22.0 + (far[1] - o["m"][1]) * 0.6)
+    # keep the note out of the (thk)/(R) row above the view
+    if note_xy[1] > bb[3] + 6:
+        note_xy = (note_xy[0], bb[3] + 6)
+    try:
+        rep["face_a_note"] = sv._insert_note("FACE A", round(note_xy[0], 1), round(note_xy[1], 1), profile_view, o["i"], None).get("note")
+    except Exception as ex:  # noqa: BLE001
+        rep["face_a_note_error"] = str(ex)
+
+    # 2. the normal view: created once (unlabelled), measured, moved ONCE, then labelled at its final place
+    n_model = _sheet_normal_to_model(g, n)
+    rep["face_normal_model"] = n_model
+    bo = _outline(_view_by_name(drawing, base_view)) or bb
+    x, y = (bo[0] + bo[2]) / 2, bo[3] + GAP_V + 40.0
+    nv = sv._normal_to_face_view(model_path, n_model, x, y, scale, None, 18)
+    nname = nv.get("name")
+    if not nname:
+        raise SWError("FACE A normal view was not created")
+    vobj = _view_by_name(drawing, nname)
+    no = nv.get("outline_mm") or _outline(vobj) or [x - 50, y - 30, x + 50, y + 30]
+    w, h = no[2] - no[0], no[3] - no[1]
+    # GAP_V (geometry to geometry; outlines carry an 11.5 mm margin each) above the base view; if that
+    # reaches the notes block (its last line sits near y≈465 on the D sheet), right of the profile instead
+    y = bo[3] + (GAP_V - 23.0) + h / 2
+    if y + h / 2 > 468.0:
+        po = _outline(_view_by_name(drawing, profile_view)) or bb
+        x, y = po[2] + (GAP_H - 23.0) + w / 2, (po[1] + po[3]) / 2
+    _set_pos(vobj, x, y)
+    slip._rebuild(drawing)
+    no = _outline(vobj) or [x - w / 2, y - h / 2, x + w / 2, y + h / 2]
+    label = None
+    try:
+        label = sv._insert_note("FACE A - NORMAL VIEW", round((no[0] + no[2]) / 2, 1), round(no[1] - 18.0, 1), None, None, None).get("note")
+    except Exception as ex:  # noqa: BLE001
+        rep["label_error"] = str(ex)
+    rep["normal_view"] = {"name": nname, "outline_mm": no, "label": label}
+
+    # 3. the face's one feature, located from the flange end and the tip edge
+    gn = _geom(nname)
+    edges, summ = gn["edges"], gn["summary"]
+    nb = summ["bbox_mm"]
+    L = inc["len"]
+    # the flange's side edges appear at true length here; they bound the face across the strip
+    # (tight: 108706's foreshortened base ends were 17.96 vs the flange's 18.50 — a 1 mm band took them)
+    sides_v = [r for r in _lines(edges, False) if abs(r.get("len", 0) - L) < max(0.3, 0.015 * L)]
+    sides_h = [r for r in _lines(edges, True) if abs(r.get("len", 0) - L) < max(0.3, 0.015 * L)]
+    fdims = []
+    if len(sides_v) >= 2 or len(sides_h) >= 2:
+        vertical = len(sides_v) >= 2
+        sides = sorted(sides_v if vertical else sides_h, key=lambda r: r["m"][0] if vertical else r["m"][1])
+        s1, s2 = sides[0], sides[-1]
+        if vertical:
+            xs = (s1["s"][0], s2["s"][0])
+            ylo = min(s1["s"][1], s1["e"][1]); yhi = max(s1["s"][1], s1["e"][1])
+            # tip edge: the long axis line just beyond the far end of the side lines
+            tips = [r for r in _lines(edges, True) if min(r["s"][0], r["e"][0]) <= xs[0] + 5 and max(r["s"][0], r["e"][0]) >= xs[1] - 5]
+            tip_top = [r for r in tips if r["s"][1] >= yhi - 0.5]
+            tip_bot = [r for r in tips if r["s"][1] <= ylo + 0.5]
+            tip = min(tip_top, key=lambda r: r["s"][1]) if tip_top else (max(tip_bot, key=lambda r: r["s"][1]) if tip_bot else None)
+            region = [xs[0], ylo - 3, xs[1], (tip["s"][1] if tip else yhi) + 3]
+        else:
+            ys = (s1["s"][1], s2["s"][1])
+            xlo = min(s1["s"][0], s1["e"][0]); xhi = max(s1["s"][0], s1["e"][0])
+            tips = [r for r in _lines(edges, False) if min(r["s"][1], r["e"][1]) <= ys[0] + 5 and max(r["s"][1], r["e"][1]) >= ys[1] - 5]
+            tip_r = [r for r in tips if r["s"][0] >= xhi - 0.5]
+            tip_l = [r for r in tips if r["s"][0] <= xlo + 0.5]
+            tip = min(tip_r, key=lambda r: r["s"][0]) if tip_r else (max(tip_l, key=lambda r: r["s"][0]) if tip_l else None)
+            region = [xlo - 3, ys[0], (tip["s"][0] if tip else xhi) + 3, ys[1]]
+        rep["face_region_mm"] = [round(v, 1) for v in region]
+        circles = [r for r in edges if r.get("t") == "circle" and region[0] <= r["c"][0] <= region[2] and region[1] <= r["c"][1] <= region[3]]
+        rects = _rect_features(edges, region)
+        tl = lambda pt: (pt[0] - region[0]) + (region[3] - pt[1])
+        row_up = nb[3] + PROJ_BAND
+        if circles:
+            c = min(circles, key=lambda r: tl(r["c"]))
+            occ: dict = {}
+            fdims += _hole_dims(summ, edges, c, occ, thk_sheet, band=PROJ_BAND)
+        elif rects:
+            rc = min(rects, key=lambda r: tl((r["x0"], r["y1"])))
+            # near side line (X) and the tip edge (Y); sizes below / beside the view
+            near_side = min((s1, s2), key=lambda r: abs(r["m"][0] - rc["x0"]) if vertical else abs(r["m"][1] - rc["y1"]))
+            if vertical:
+                left_side = near_side["m"][0] < (rc["x0"] + rc["x1"]) / 2
+                ex_ = near_side["s"][0]
+                span = abs((rc["x0"] if left_side else rc["x1"]) - ex_)
+                tx = (ex_ + (rc["x0"] if left_side else rc["x1"])) / 2 if span >= SHORT_H else (ex_ - 14.0 if left_side else ex_ + 14.0)
+                fdims.append({"type": "linear", "e1": rc["left"] if left_side else rc["right"], "e2": near_side["i"], "text": [round(tx, 1), round(row_up, 1)], "label": "cut_x"})
+                if tip is not None:
+                    top_tip = tip["s"][1] >= yhi - 0.5
+                    ey = tip["s"][1]
+                    span_y = abs((rc["y1"] if top_tip else rc["y0"]) - ey)
+                    xd = nb[0] - PROJ_BAND
+                    ty = (ey + (rc["y1"] if top_tip else rc["y0"])) / 2 if span_y >= SHORT_V else (ey + PROJ_BAND if top_tip else ey - PROJ_BAND)
+                    fdims.append({"type": "linear", "e1": rc["top"] if top_tip else rc["bottom"], "e2": tip["i"], "text": [round(xd, 1), round(ty, 1)], "label": "cut_y"})
+                # sizes: width below the view (text outside the span), height on the left band, one step out
+                fdims.append({"type": "linear", "e1": rc["left"], "e2": rc["right"], "text": [round(rc["x0"] - 14.0, 1), round(nb[1] - PROJ_BAND, 1)], "label": "cut_w"})
+                fdims.append({"type": "linear", "e1": rc["top"], "e2": rc["bottom"], "text": [round(nb[0] - PROJ_BAND - OUTER_STEP, 1), round((rc["y0"] + rc["y1"]) / 2, 1)], "label": "cut_h"})
+            else:
+                below_side = near_side["m"][1] < (rc["y0"] + rc["y1"]) / 2
+                ey_ = near_side["s"][1]
+                span = abs((rc["y0"] if below_side else rc["y1"]) - ey_)
+                ty = (ey_ + (rc["y0"] if below_side else rc["y1"])) / 2 if span >= SHORT_V else (ey_ - 14.0 if below_side else ey_ + 14.0)
+                fdims.append({"type": "linear", "e1": rc["bottom"] if below_side else rc["top"], "e2": near_side["i"], "text": [round(nb[0] - PROJ_BAND, 1), round(ty, 1)], "label": "cut_y"})
+                if tip is not None:
+                    right_tip = tip["s"][0] >= xhi - 0.5
+                    ex_ = tip["s"][0]
+                    span_x = abs((rc["x1"] if right_tip else rc["x0"]) - ex_)
+                    tx = (ex_ + (rc["x1"] if right_tip else rc["x0"])) / 2 if span_x >= SHORT_H else (ex_ + 14.0 if right_tip else ex_ - 14.0)
+                    fdims.append({"type": "linear", "e1": rc["right"] if right_tip else rc["left"], "e2": tip["i"], "text": [round(tx, 1), round(row_up, 1)], "label": "cut_x"})
+                fdims.append({"type": "linear", "e1": rc["top"], "e2": rc["bottom"], "text": [round(nb[2] + PROJ_BAND, 1), round((rc["y0"] + rc["y1"]) / 2, 1)], "label": "cut_h"})
+                fdims.append({"type": "linear", "e1": rc["left"], "e2": rc["right"], "text": [round((rc["x0"] + rc["x1"]) / 2, 1), round(nb[3] + PROJ_BAND + OUTER_STEP, 1)], "label": "cut_w"})
+        else:
+            rep["feature"] = "none found on the inclined face"
+    else:
+        rep["feature"] = "flange side edges not identified in the normal view"
+    if fdims:
+        r = sb._add_dimensions(nname, [{k: v for k, v in d.items() if k != "label"} for d in fdims])
+        rep["normal_dims"] = _compact(r, fdims)
+    return rep
 
 
 def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_radius_in, base_hole) -> dict:
@@ -1104,12 +1407,18 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
             hole = _pick_hole(summ, edges, "top_left")
             dims += _face_hole_dims(summ, edges, occ, thk_sheet, PROJ_BAND, scale)
         # flange height = horizontal extent (left/right envelope), BELOW the view (outer)
-        if env["left"] and env["right"]:
-            w_in = summ.get("width_in") or 0.0
+        w_in = summ.get("width_in") or 0.0
+        # a "width" that is just the sheet thickness means the envelope edges are one wall's two faces
+        # (108706 profile with an inclined flange: nothing else is axis-aligned) — not a flange height
+        if env["left"] and env["right"] and not (thickness_in and abs(w_in - thickness_in) < 0.02):
             if not any(abs(w_in - a) < 0.02 for a in flange_vals):
                 off = INNER_OFF + OUTER_STEP * occ.get("bottom", 0)
+                # text centred on the DIMENSION's span (not the view's), and along the line outside a
+                # short span — a dimension must never collide with itself (Simón, 108706: .435)
+                xl, xr = env["left"]["m"][0], env["right"]["m"][0]
+                tx = (xl + xr) / 2 if abs(xr - xl) >= SHORT_H else (max(xl, xr) + 14.0)
                 dims.append({"type": "linear", "e1": env["left"]["i"], "e2": env["right"]["i"],
-                             "text": [round((bb[0] + bb[2]) / 2, 1), round(bb[1] - off, 1)], "label": "flange_h"})
+                             "text": [round(tx, 1), round(bb[1] - off, 1)], "label": "flange_h"})
                 occ["bottom"] = occ.get("bottom", 0) + 1
                 flange_vals.append(w_in)
         if thk_sheet:
@@ -1121,6 +1430,14 @@ def _dimension_slip_views(base_view, edge_view, side_view, thickness_in, bend_ra
             report["views"][side_view] = _compact(r, dims)
     report["thk_r_on"] = thk_r_on
     report["flange_lengths_in"] = [round(v, 4) for v in flange_vals]
+    # inclined (non-90°) flanges seen edge-on -> the FACE A stage takes them
+    incl = []
+    for vname, gg in ((side_view, gs), (edge_view, ge)):
+        if gg:
+            for k in _inclined_pairs(gg, thk_sheet):
+                # the view's geometry rides along so the FACE A stage does not read it again
+                incl.append({"view": vname, "angle_deg": k["angle_deg"], "len_mm": round(k["len"], 2), "geom": gg})
+    report["inclined"] = incl
     return report
 
 
@@ -1191,7 +1508,8 @@ def _insert_flat_view(drawing, model_path, cfg, x_mm, y_mm, flip=False, flip_var
                 break
         except Exception as ex:  # noqa: BLE001
             logger.info("flat view insert raised %s", ex)
-    slip._rebuild(drawing)
+    if flip:
+        slip._rebuild(drawing)   # the plain insert is rebuilt by the caller after scale + display
     name = _try(lambda: v.Name) if v is not None else None
     if not name:
         name = sv._new_view_name(drawing, before)
@@ -1253,12 +1571,12 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
     tried = []
     fname, fview = _insert_flat_view(drawing, model_path, cfg, x_mm, y_mm, False, 0)
     _set_scale(fview, s)
+    _try(lambda: slip._set_view_display(fname, "hidden_lines_removed", "removed"))
     slip._rebuild(drawing)
-    g0, p0 = measure(fname)
-    bb0 = g0["summary"]["bbox_mm"]
-    w0, h0 = bb0[2] - bb0[0], bb0[3] - bb0[1]
     flip, variant, ang, err_best = False, 0, 0, None
+    moved = False
     if match_base_view:
+        g0, p0 = measure(fname)
         # optional: flip/rotate so the hole pattern matches the base view (centroid-aligned metric)
         best = None
         for fl, var in ((False, 0), (True, 1), (True, 2)):
@@ -1284,21 +1602,27 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
             _try(lambda: slip._delete_view(fname))
             fname, fview = _insert_flat_view(drawing, model_path, cfg, x_mm, y_mm, flip, variant)
             _set_scale(fview, s)
+            _try(lambda: slip._set_view_display(fname, "hidden_lines_removed", "removed"))
         set_angle(fview, ang)
+        moved = True
     else:
         # Simón 2026-09-17: the flat does NOT need to match the formed views' orientation — keep it
         # as SolidWorks inserts it; rotate 90° only when it would not fit the sheet otherwise.
+        # (the outline is enough for the fit check — no full geometry read here)
+        o0 = _outline(fview) or [0, 0, 0, 0]
+        w0, h0 = (o0[2] - o0[0]) - 23.0, (o0[3] - o0[1]) - 23.0   # GetOutline margin 11.5 per side
         max_h = 340.0   # notes block above, title block below (D sheet)
         max_w = 640.0
         if (h0 > max_h or w0 > max_w) and (w0 <= max_h and h0 <= max_w):
             ang = 90
             set_angle(fview, ang)
             tried.append({"rotated_to_fit": ang})
+            moved = True
     logger.info("flat orientation: flip=%s angle=%s match_base_view=%s tried=%s", flip, ang, match_base_view, tried)
     err_after = err_best
-    _try(lambda: slip._set_view_display(fname, "hidden_lines_removed", "removed"))
-    _set_pos(fview, x_mm, y_mm)
-    slip._rebuild(drawing)
+    if moved:   # rotation shifts the view about its origin: re-centre it (a fresh insert is already there)
+        _set_pos(fview, x_mm, y_mm)
+        slip._rebuild(drawing)
     g = _geom(fname)
     summ, edges = g["summary"], g["edges"]
     bb = summ["bbox_mm"]
@@ -1337,18 +1661,33 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
                 groups.setdefault(("v", near_left), []).append((span, ref["i"], b["i"], m, edge_x))
     for (orient, side), items in groups.items():
         items.sort(key=lambda t: t[0])
+        prev_span = 0.0
         for n, (span, ref_i, bend_i, m, edge) in enumerate(items):
             off = INNER_OFF + OUTER_STEP * n
+            # text on the part of the span the inner dimension does not cover (108706 flat: .884 and
+            # 1.301 from the same edge had their texts 5 mm apart on adjacent rows) — else mid-span;
+            # a short span puts the text along the dimension line, outside the span
+            sgn = (-1.0 if side else 1.0) if orient == "h" else (1.0 if side else -1.0)
+            free = span - prev_span
             if orient == "h":
-                # vertical dimension on the LEFT of the view; short span: text ALONG the dim, outside the span
-                ty = (m[1] + edge) / 2 if span >= SHORT_V else (edge + 12 if side else edge - 12)
+                if span < SHORT_V:
+                    ty = edge + 12 if side else edge - 12
+                elif free >= SHORT_V:
+                    ty = edge + sgn * (prev_span + free / 2)
+                else:
+                    ty = (m[1] + edge) / 2
                 bend_dims.append({"e_ref": ref_i, "bend": bend_i, "text": [round(bb[0] - off, 1), round(ty, 1)]})
                 occupied["left"] = max(occupied.get("left", 0), n + 1)
             else:
-                # horizontal dimension ABOVE the view
-                tx = (m[0] + edge) / 2 if span >= SHORT_H else (edge - 14 if side else edge + 14)
+                if span < SHORT_H:
+                    tx = edge - 14 if side else edge + 14
+                elif free >= SHORT_H:
+                    tx = edge + sgn * (prev_span + free / 2)
+                else:
+                    tx = (m[0] + edge) / 2
                 bend_dims.append({"e_ref": ref_i, "bend": bend_i, "text": [round(tx, 1), round(bb[3] + off, 1)]})
                 occupied["top"] = max(occupied.get("top", 0), n + 1)
+            prev_span = span
     rb = sv._add_bend_dimensions(fname, bend_dims) if bend_dims else {"dimensions": []}
     # edge indices can change after annotations are added: re-read before the envelope dims
     summ = _geom(fname)["summary"]
@@ -1363,26 +1702,27 @@ def _slip_flat_sheet(model_path, base_view, scale, sheet_name, x_mm, y_mm, match
 
 # --------------------------------------------------------------------------- export
 
-def _export_slip_pdf(pdf_path, save, png_per_sheet=False) -> dict:
+def _export_slip_pdf(pdf_path, save, png_per_sheet=False, save_path=None, rev=None) -> dict:
     drawing = slip._active_drawing()
     out = {"status": "done"}
     path = _try(lambda: str(_val(drawing, "GetPathName"))) or ""
+    if not path and save_path:
+        path = save_path            # new drawing, never saved: the pipeline's one SaveAs happens here
     if save and path:
         out["save"] = _save_drawing_as(drawing, path)
     if not pdf_path:
         pn = os.path.splitext(os.path.basename(path))[0] or "drawing"
-        rev = "R00"
-        try:
-            views = _get_drawing_views(drawing, None)
-            for _, v in views:
-                m = _try(lambda: _val(v, "ReferencedDocument"))
-                if m is not None:
-                    r = _custom_props(m, ("REVISION",)).get("REVISION")
-                    if r:
-                        rev = r
-                    break
-        except Exception:  # noqa: BLE001
-            pass
+        if rev is None:
+            # caller did not pass the revision (standalone tool use): read it from the model
+            try:
+                for _, v in _get_drawing_views(drawing, None):
+                    m = _try(lambda: _val(v, "ReferencedDocument"))
+                    if m is not None:
+                        rev = _custom_props(m, ("REVISION",)).get("REVISION") or None
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        rev = rev or "R00"
         pdf_path = os.path.join(os.path.dirname(path) or r"C:\Drawings", f"{pn}-{rev}.pdf")
     errs, warns = _byref_i4(), _byref_i4()
     import pythoncom

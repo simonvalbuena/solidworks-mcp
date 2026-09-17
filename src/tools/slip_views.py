@@ -153,7 +153,7 @@ def _new_view_name(drawing, before: set[str]) -> str | None:
 
 # --------------------------------------------------------------------------- project_view
 
-def _project_view(parent_view, direction, x_mm, y_mm) -> dict:
+def _project_view(parent_view, direction, x_mm, y_mm, rebuild=True) -> dict:
     drawing = slip._active_drawing()
     d = str(direction).lower().strip()
     if d not in _DIRS:
@@ -208,10 +208,11 @@ def _project_view(parent_view, direction, x_mm, y_mm) -> dict:
     info = _view_info(nv)
     info.update({"status": "done", "parent": pname, "direction_requested": d,
                  "direction_implied_by_point": implied, "linked": True})
-    try:
-        slip._rebuild(drawing)
-    except Exception:  # noqa: BLE001
-        pass
+    if rebuild:   # the pipeline rebuilds once after its last projection instead
+        try:
+            slip._rebuild(drawing)
+        except Exception:  # noqa: BLE001
+            pass
     return info
 
 
