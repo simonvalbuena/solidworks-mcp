@@ -14,7 +14,7 @@ from sw_connection import SWConnection
 logger = logging.getLogger(__name__)
 
 # swUserPreferenceToggle_e
-SW_INPUT_DIM_VAL_ON_CREATE = 220
+SW_INPUT_DIM_VAL_ON_CREATE = 10   # swUserPreferenceToggle_e.swInputDimValOnCreate (from swconst.tlb; 220 was swImportMultBodyAsPartData — the Modify dialog kept appearing for sketch-point dims)
 
 # swLengthUnit_e
 SW_UNIT_MM = 0

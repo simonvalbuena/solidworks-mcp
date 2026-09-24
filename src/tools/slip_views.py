@@ -292,7 +292,7 @@ def _planar_faces(body):
     return faces
 
 
-def _normal_to_face_view(model_path, normal, x_mm, y_mm, scale, label, label_offset_mm) -> dict:
+def _normal_to_face_view(model_path, normal, x_mm, y_mm, scale, label, label_offset_mm, view_name="FACE_A_NORMAL") -> dict:
     app = SWConnection.get_instance().get_app()
     drawing = slip._active_drawing()
     n = _unit([float(c) for c in normal])
@@ -416,7 +416,7 @@ def _normal_to_face_view(model_path, normal, x_mm, y_mm, scale, label, label_off
         pass
     part.ClearSelection2(True)
     # a named view is far more reliable than "*Current" for CreateDrawViewFromModelView3
-    named = "FACE_A_NORMAL"
+    named = view_name or "FACE_A_NORMAL"
     try:
         part.NameView(named)
         logger.info("normal_to_face_view: NameView(%s)", named)

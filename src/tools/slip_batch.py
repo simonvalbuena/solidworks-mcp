@@ -676,7 +676,43 @@ def _add_dimension_to_intersection(view_name, e_line1, e_line2, e_ref, text, ref
     ip = ((sheet_x - cx) / vs, (sheet_y - cy) / vs)
     logger.info("sharp: rotated=%s sheet_unbroken_m=(%s,%s) position=(%s,%s) scale=%s -> sketch=%s",
                 ip_rot, sheet_x, sheet_y, cx, cy, vs, ip)
+    return _dim_edge_to_sketch_point(app, drawing, vname, view_obj, edges, ip, e_ref, text, reference)
 
+
+def _add_dimension_to_point(view_name, point_mm, e_ref, text, reference) -> dict:
+    """Linear dimension from edge `e_ref` to a SHEET point (mm) — a sketch point is created there in the
+    view's sketch, exactly as the virtual-sharp dimension does. Used for the envelope to a bounding-box
+    extreme that is no edge SolidWorks can dimension to (108692 plan view: the lug's round end seen
+    edge-on is a 0.3 mm sliver arc whose arc-max condition measures nothing useful; its end vertex IS
+    the extreme)."""
+    app = SWConnection.get_instance().get_app()
+    drawing = slip._active_drawing()
+    views = _get_drawing_views(drawing, view_name)
+    if not views:
+        raise SWError(f"view not found: {view_name}")
+    vname, view_obj = views[0]
+    drawing.ActivateView(vname)
+    edges = _get_view_edges(view_obj)
+    if int(e_ref) < 0 or int(e_ref) >= len(edges):
+        raise SWError(f"edge index {e_ref} out of range 0..{len(edges)-1}")
+    try:
+        pos = view_obj.Position
+        cx, cy = float(pos[0]), float(pos[1])
+    except Exception as ex:  # noqa: BLE001
+        raise SWError(f"IView.Position unavailable: {ex}")
+    try:
+        vs = float(view_obj.ScaleDecimal) or 1.0
+    except Exception:  # noqa: BLE001
+        vs = 1.0
+    ux, uy = slip._to_unbroken(vname, view_obj, float(point_mm[0]), float(point_mm[1]))
+    ip = ((ux / _M_TO_MM - cx) / vs, (uy / _M_TO_MM - cy) / vs)
+    logger.info("point-dim: sheet_mm=%s unbroken_mm=(%s,%s) position=(%s,%s) scale=%s -> sketch=%s",
+                point_mm, ux, uy, cx, cy, vs, ip)
+    return _dim_edge_to_sketch_point(app, drawing, vname, view_obj, edges, ip, e_ref, text, reference)
+
+
+def _dim_edge_to_sketch_point(app, drawing, vname, view_obj, edges, ip, e_ref, text, reference) -> dict:
+    """Create a sketch point at view-sketch coordinates `ip` (m), select it + edge `e_ref`, AddDimension2."""
     # sketch point at the virtual sharp, in the view's sketch (what Find Intersection creates).
     # 2026-09-09: the first version toggled SketchManager.AddToDB and selected the point with
     # ISketchPoint.Select4(True, None) -> SolidWorks crashed (RPC failed). Now: plain CreatePoint
