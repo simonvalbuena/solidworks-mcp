@@ -283,6 +283,19 @@ def _set_feature_properties(feature_name, props, interface=""):
             except Exception:  # noqa: BLE001
                 before[k] = None
             slip._put(d, k, v)
+        # K-factor lives in the custom bend allowance object (a plain KFactor put does not stick)
+        if "KFactor" in props:
+            try:
+                cba = slip._inv(d, "GetCustomBendAllowance")
+                if cba is not None:
+                    slip._put(cba, "Type", 2)   # swBendAllowanceKFactor
+                    slip._put(cba, "KFactor", float(props["KFactor"]))
+                    try:
+                        slip._inv(d, "SetCustomBendAllowance", cba)
+                    except Exception as ex:  # noqa: BLE001
+                        log.append(f"SetCustomBendAllowance: {str(ex)[:60]}")
+            except Exception as ex:  # noqa: BLE001
+                log.append(f"custom bend allowance: {str(ex)[:60]}")
         ok = bool(slip._inv(feat, "ModifyDefinition", d, doc, no_comp))
     except Exception as ex:  # noqa: BLE001
         if accessed:

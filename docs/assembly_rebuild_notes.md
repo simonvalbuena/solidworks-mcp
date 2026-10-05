@@ -55,3 +55,32 @@ identical to the original (`component_positions` on both).
   interface name from sldworks.tlb (`dump_feature` does this; `sw_api` lists any interface).
 - Default profile placement on a vertical line in the Right Plane gives the profile sides aligned
   with X/Z (no rotation needed for a square tube).
+
+## Sketch definition — Simón's conventions (read with `read_sketch` from the MAIN COLUMN originals)
+
+Every sketch fully defined, with as few dimensions as possible; relations carry the intent.
+
+- **Origin first.** A vertex on the origin (gusset, tube path), or the profile centred on it
+  (plate: side midpoints vertical/horizontal-aligned with the origin; a center rectangle's center
+  point coincident with the origin is the equivalent used in the RB rebuild).
+- **Point-to-point dimensions** between vertices / hole centres, not line-length dimensions.
+- **Equal + one size.** Repeated holes / notches: equal relations and ONE Ø or width/depth dimension.
+- **Symmetry / midpoints instead of position dims.** Construction lines carry the layout: plate holes
+  sit at the midpoint of construction diagonals from a 152.4 construction square to the plate
+  corners (no hole-position dimension at all); hole triplets use a cross construction line with the
+  centre hole at its midpoint and a 63.5 spacing on one triplet, the middle triplet at the midpoint
+  of an axis construction line.
+- **Features on an edge reference the edge.** Tab corners coincident with model edges (bottom edge,
+  hypotenuse); notch outer lines collinear with the outline sketch's lines; only width/depth dimensioned.
+- **Hole rows**: centres aligned (vertical/horizontal point relations) with each other / the origin;
+  spacings baseline from the first hole (111.125, 698.5 from hole A); end holes from the tube END
+  EDGE (76.2) or from the origin (457.2).
+- In-context originals: some tube circles are converted edges (useedge) from outside references;
+  in a standalone rebuild they become dimensions from the origin / the tube end.
+
+`define_sketch` reproduces all of this: relations via ISketchRelationManager.AddRelation (no
+selection needed; the origin is the OriginProfileFeature's sketch point), refs to model edges,
+planes and other sketches, dimensions with the Modify dialog suppressed. RB result: all 9 sketches
+fully defined, all 3 parts PASS exact vs the originals, assembly transforms unchanged.
+Open: K-factor 0.45 does not apply through ModifyDefinition (custom bend allowance) — RB parts
+keep 0.5 (no bends, geometry unaffected).

@@ -176,10 +176,12 @@ def _select_face(app, doc, selmgr, comp_name, point_mm, mark):
                 return ent, f"Select4 ({label})", d * 1000
             logger.info("Select4 picked component %r, wanted %r", got, comp_name)
     # fallback: ray pick at the assembly point, then verify the component
+    import pythoncom
+    from win32com.client import VARIANT
     before = _sel_count(selmgr)
     ext = slip._inv(doc, "Extension")
     ok = bool(slip._inv(ext, "SelectByID2", "", "FACE", p_asm[0], p_asm[1], p_asm[2],
-                        True, int(mark), None, 0))
+                        True, int(mark), VARIANT(pythoncom.VT_DISPATCH, None), 0))
     n = _sel_count(selmgr)
     if ok and n == before + 1:
         got = _selected_component_name(selmgr, n)
