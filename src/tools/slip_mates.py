@@ -149,6 +149,50 @@ def _selected_component_name(selmgr, idx):
         return None
 
 
+def _select_ref(app, doc, selmgr, spec, mark):
+    """Planes and edges besides faces: {"plane": name} (assembly plane), {"component": c,
+    "plane": name} (component plane), {"component": c, "edge": [x, y, z]} (assembly mm)."""
+    before = _sel_count(selmgr)
+    if "plane" in spec:
+        if spec.get("component"):
+            comp = _find_component(doc, spec["component"])
+            feat = slip._inv(comp, "FeatureByName", spec["plane"])
+        else:
+            feat = slip._inv(doc, "FeatureByName", spec["plane"])
+        if feat is None:
+            raise SWError(f"plane {spec['plane']!r} not found ({spec.get('component') or 'assembly'})")
+        if not bool(slip._inv(feat, "Select2", True, int(mark))) or _sel_count(selmgr) != before + 1:
+            raise SWError(f"could not select plane {spec['plane']!r}")
+        return slip._inv(selmgr, "GetSelectedObject6", before + 1, -1), "plane", None
+    # edge
+    comp = _find_component(doc, spec["component"])
+    p_asm = [c / 1000.0 for c in spec["edge"]]
+    p = _to_component_frame(app, comp, p_asm)
+    bodies = []
+    try:
+        b = slip._inv(comp, "GetBodies2", 0)
+        bodies = list(b) if isinstance(b, (tuple, list)) else [b]
+    except Exception:  # noqa: BLE001
+        bodies = [slip._inv(comp, "GetBody")]
+    best, bd = None, float("inf")
+    for body in bodies:
+        for e in list(slip._inv(body, "GetEdges") or ()):
+            try:
+                r = slip._inv(e, "GetClosestPointOn", p[0], p[1], p[2])
+                d = math.dist([float(r[0]), float(r[1]), float(r[2])], p)
+            except Exception:  # noqa: BLE001
+                continue
+            if d < bd:
+                best, bd = e, d
+    if best is None or bd > _FACE_TOL_M:
+        raise SWError(f"no edge of {spec['component']!r} at {spec['edge']} mm")
+    sd = slip._inv(selmgr, "CreateSelectData")
+    slip._put(sd, "Mark", int(mark))
+    if not bool(slip._inv(best, "Select4", True, sd)) or _sel_count(selmgr) != before + 1:
+        raise SWError("could not select the edge")
+    return slip._inv(selmgr, "GetSelectedObject6", before + 1, -1), "edge", bd * 1000
+
+
 def _select_face(app, doc, selmgr, comp_name, point_mm, mark):
     """Append-select the face of comp_name containing point_mm; returns (entity, how, dist_mm)."""
     comp = _find_component(doc, comp_name)
@@ -222,9 +266,12 @@ def _add_mate_faces(mate_type, faces, alignment, distance_mm, flip, width_constr
     ents, picks = [], []
     for i, f in enumerate(faces):
         mark = (1 if i < 2 else 2) if mate_type == "width" else 1
-        ent, how, d = _select_face(app, doc, selmgr, f["component"], f["point"], mark)
+        if "plane" in f or "edge" in f:
+            ent, how, d = _select_ref(app, doc, selmgr, f, mark)
+        else:
+            ent, how, d = _select_face(app, doc, selmgr, f["component"], f["point"], mark)
         ents.append(ent)
-        picks.append({"component": f["component"], "point": f["point"], "how": how,
+        picks.append({"component": f.get("component"), "point": f.get("point") or f.get("edge") or f.get("plane"), "how": how,
                       "dist_mm": None if d is None else round(d, 4)})
     log = []
     mate = None
@@ -316,7 +363,8 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
     ) -> str:
         """Add a mate in the ACTIVE assembly between faces named by component + a point on the face.
         faces: JSON list of {"component": "TUBE-1", "point": [x, y, z]} — point in ASSEMBLY mm,
-        lying on the face (interior, not on an edge).
+        lying on the face (interior, not on an edge); or {"plane": "Front Plane"} (assembly plane),
+        {"component": c, "plane": "Front Plane"} (component plane), {"component": c, "edge": [x, y, z]}.
         mate_type: coincident | concentric | parallel | perpendicular | distance | width.
         width: 4 faces — first two = width pair (outer bounds), last two = tab pair (centred);
         width_constraint centered|free|dimension|percent.
