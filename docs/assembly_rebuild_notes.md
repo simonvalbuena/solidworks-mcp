@@ -25,8 +25,13 @@ identical to the original (`component_positions` on both).
 
 ## Gaps found in the tools
 
-- `sheet_metal_feature(base_flange)` on an existing sheet-metal body makes a second body instead of
-  a Tab. Workaround: merged boss extrude of the same profile (into the material).
+- ~~Tab came out as a second body~~ → `sheet_metal_tab` (fork). A Tab is
+  `InsertSheetMetalBaseFlange2(..., Merge=True, UseFeatScope=False, UseAutoSelect=True)` on a closed
+  sketch on a face of the sheet-metal body (shows as "Tab<n>", type SMBaseFlange); solidpilot's
+  base_flange leaves Merge off. Thickness / radius / K come from the part's Sheet-Metal feature.
+  Swapping the RB gusset's boss-extrude for Tab1 kept all 15 assembly mates resolved.
+- Sheet-metal parameters must be copied too, not only geometry: the originals use bend radius
+  1.3208 mm, K 0.45 (read with `dump_feature`); `set_feature_properties` edits them in place.
 - ~~No weldment structural members~~ → `insert_structural_member` (fork). Second run: tube rebuilt
   as a real weldment (Weldment feature + TS5x5x0.25 member on a 4000.5 mm path line + 3 cuts, which
   SolidWorks makes as weldment cuts "ICE"); config `DEFAULT<As Machined>` like the original;

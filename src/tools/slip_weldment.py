@@ -194,7 +194,7 @@ _DEF_HINT = {"WeldMemberFeat": "IStructuralMemberFeatureData", "Cut": "IExtrudeF
              "Extrusion": "IExtrudeFeatureData2", "Boss": "IExtrudeFeatureData2",
              "ICE": "IExtrudeFeatureData2", "SMBaseFlange": "IBaseFlangeFeatureData",
              "Chamfer": "IChamferFeatureData2", "Fillet": "ISimpleFilletFeatureData2",
-             "WeldmentFeature": "IWeldmentFeatureData"}
+             "WeldmentFeature": "IWeldmentFeatureData", "SheetMetal": "ISheetMetalFeatureData"}
 
 
 def _dump_props(obj, depth=1, hint=""):
@@ -257,6 +257,57 @@ def _dump_feature(feature_name, depth, interface=""):
     except Exception:  # noqa: BLE001
         pass
     return res
+
+
+def _set_feature_properties(feature_name, props, interface=""):
+    """GetDefinition -> put properties -> ModifyDefinition (in place, keeps face ids)."""
+    app = SWConnection.get_instance().get_app()
+    doc = slip._inv(app, "ActiveDoc")
+    feat = _feature(doc, feature_name)
+    ftype = str(slip._inv(feat, "GetTypeName2"))
+    d = slip._inv(feat, "GetDefinition")
+    log = []
+    accessed = False
+    import pythoncom
+    from win32com.client import VARIANT
+    no_comp = VARIANT(pythoncom.VT_DISPATCH, None)   # a plain None is rejected ("Type mismatch")
+    try:
+        accessed = bool(slip._inv(d, "AccessSelections", doc, no_comp))
+    except Exception as ex:  # noqa: BLE001
+        log.append(f"AccessSelections: {str(ex)[:60]}")
+    before, after = {}, {}
+    try:
+        for k, v in props.items():
+            try:
+                before[k] = slip._inv(d, k)
+            except Exception:  # noqa: BLE001
+                before[k] = None
+            slip._put(d, k, v)
+        ok = bool(slip._inv(feat, "ModifyDefinition", d, doc, no_comp))
+    except Exception as ex:  # noqa: BLE001
+        if accessed:
+            try:
+                slip._inv(d, "ReleaseSelectionAccess")
+            except Exception:  # noqa: BLE001
+                pass
+        raise SWError(f"set_feature_properties: {ex}")
+    if not ok and accessed:
+        try:
+            slip._inv(d, "ReleaseSelectionAccess")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        slip._inv(doc, "EditRebuild3")
+    except Exception:  # noqa: BLE001
+        pass
+    d2 = slip._inv(_feature(doc, feature_name), "GetDefinition")
+    for k in props:
+        try:
+            after[k] = slip._inv(d2, k)
+        except Exception:  # noqa: BLE001
+            after[k] = None
+    return {"status": "done" if ok else "failed", "feature": feature_name, "type": ftype,
+            "before": before, "after": after, "log": log, **_body_report(doc)}
 
 
 # --------------------------------------------------------------------------- profiles
@@ -463,6 +514,16 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         depth: how far nested objects (groups, segments) are expanded. interface: the definition
         interface when it cannot be guessed from the feature type (e.g. "IExtrudeFeatureData2"). Read-only."""
         return await slip_tube._run(sw, "dump_feature", _dump_feature, feature_name, depth, interface)
+
+    @mcp.tool()
+    async def set_feature_properties(feature_name: str, properties: str) -> str:
+        """Edit a feature IN PLACE (keeps face ids, so assembly mates survive): reads its definition
+        (IFeature.GetDefinition), sets the given properties, ModifyDefinition, rebuild.
+        properties: JSON object, names as dump_feature shows them, SI units, angles in radians —
+        e.g. {"BendRadius": 0.0013208, "KFactor": 0.45} on a Sheet-Metal feature.
+        Returns before/after values, body count, volume."""
+        return await slip_tube._run(sw, "set_feature_properties", _set_feature_properties,
+                                    feature_name, json.loads(properties))
 
     @mcp.tool()
     async def find_weldment_profiles(name_filter: str = "") -> str:
