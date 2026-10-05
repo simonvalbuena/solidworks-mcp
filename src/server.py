@@ -35,6 +35,7 @@ def register_all_tools() -> None:
     from tools.slip_inspect import register_tools as register_slip_inspect
     from tools.slip_auto import register_tools as register_slip_auto
     from tools.slip_mates import register_tools as register_slip_mates
+    from tools.slip_weldment import register_tools as register_slip_weldment
 
     register_file_ops(mcp, sw)
     register_drawing(mcp, sw)
@@ -48,6 +49,7 @@ def register_all_tools() -> None:
     register_slip_inspect(mcp, sw)
     register_slip_auto(mcp, sw)
     register_slip_mates(mcp, sw)
+    register_slip_weldment(mcp, sw)
 
 
 register_all_tools()

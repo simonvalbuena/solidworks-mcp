@@ -27,10 +27,26 @@ identical to the original (`component_positions` on both).
 
 - `sheet_metal_feature(base_flange)` on an existing sheet-metal body makes a second body instead of
   a Tab. Workaround: merged boss extrude of the same profile (into the material).
-- No weldment structural members: tube rebuilt as an extruded rounded-square profile (geometry
-  exact, but no cut list / weldment properties).
+- ~~No weldment structural members~~ → `insert_structural_member` (fork). Second run: tube rebuilt
+  as a real weldment (Weldment feature + TS5x5x0.25 member on a 4000.5 mm path line + 3 cuts, which
+  SolidWorks makes as weldment cuts "ICE"); config `DEFAULT<As Machined>` like the original;
+  `compare_parts` PASS exact; assembly re-mated, all 6 transforms identical to the original.
 - `add_edge_feature` with `edges_json` coordinates failed on the 4th of 4 edges; `edge_indices` works.
   `edge_indices` must be a JSON array string ("[0]").
 - `add_assembly_mate` (solidpilot) has only coincident / concentric / distance → `add_mate_faces`
   (fork) adds parallel, perpendicular and width, and picks faces per component (no confusion
   between coincident faces of different components).
+
+## Weldment API facts (read from sldworks.tlb / a SolidWorks-made member, SW 2025)
+
+- `IFeatureManager.InsertStructuralWeldment5(Path, ConnectedSegmentsOption, AllowProtrusion, Groups,
+  ConfigurationName)`; Groups = VARIANT array of `IFeatureManager.CreateStructuralMemberGroup()`
+  objects whose `Segments` = VARIANT array of sketch segments. The tool inserts the Weldment feature
+  first if the tree has none. The path sketch must not be in edit mode.
+- Original member settings: profile `...\weldment profiles\ANSI eq\Tube (square)\TS5x5x0.25.sldlfp`,
+  ConnectedSegmentsOption 1, AllowProtrusion true, group Angle 0, ApplyCornerTreatment true,
+  CornerTreatmentType 1, MirrorProfileAxis 1, AlignAxis 1.
+- Feature-definition objects often expose no typeinfo (GetTypeInfo → "Invalid index"): read them by
+  interface name from sldworks.tlb (`dump_feature` does this; `sw_api` lists any interface).
+- Default profile placement on a vertical line in the Right Plane gives the profile sides aligned
+  with X/Z (no rotation needed for a square tube).
