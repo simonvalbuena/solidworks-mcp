@@ -84,3 +84,32 @@ planes and other sketches, dimensions with the Modify dialog suppressed. RB resu
 fully defined, all 3 parts PASS exact vs the originals, assembly transforms unchanged.
 Open: K-factor 0.45 does not apply through ModifyDefinition (custom bend allowance) — RB parts
 keep 0.5 (no bends, geometry unaffected).
+
+## Third run: `RAIL - HAT SECTION ASSY - LONG` (rail + 4 brackets, 6 mates, 2 mirrors)
+
+Rebuilt into `C:\Drawings\_rebuild\RAIL - HAT SECTION ASSY - LONG\`. Rail RB: `compare_parts` PASS
+exact (topology 1-407-1133-678, dV 0.0000 %), 26 features with the original names and order, every
+sketch fully defined, A36. Bracket RB PASS exact. Assembly RB: same 6 mates (types, alignments,
+entity kinds, names), MirrorComponent1 (Right Plane) + MirrorComponent2 (Front Plane), all 5
+component transforms identical to the original.
+
+Lessons / tool changes:
+- **Point alignment**: `AddRelation([pt, pt], VERTICAL)` keeps only the first point (a dangling
+  one-point relation) — rows/columns of slots stayed free. Use VERTPOINTS/HORIZPOINTS (26/25);
+  define_sketch now maps point-pair vertical/horizontal automatically and deletes dangling relations.
+- **Big sketches** (64 slots, 640 relations): each AddRelation re-solves the whole sketch (~2 s);
+  calls exceed the 60 s device link timeout but finish server-side — wait, then check with
+  `read_sketch(summary=true)` (counts + not-fully-defined entities, seconds instead of minutes).
+- **Slots**: primitives (centre line + 2 arcs + 2 lines) via solidpilot add_sketch_entity, then
+  tangents ×4, vertical centre line, equal arcs/centre lines to one master slot with R + length.
+- **Sketch on thin faces** (3 mm flange tips): solidpilot create_sketch's view-pick fails →
+  `sketch_on_face` picks the face geometrically and returns the sketch frame.
+- An empty sketch is discarded when another tool closes it — add the first entity in the same
+  session (sketch_on_face / solidpilot add_sketch_entity) before calling fork tools on it.
+- solidpilot `rectangle` adds construction diagonals + centre point (fine for a window located by
+  its centre; `cleanup_sketch` removes them where the original has plain lines).
+- Edge refs (`{"edge": [x,y,z]}`) scan every body edge — slow on a part with 1000+ edges.
+- In-context originals (converted edges, external points) become dimensions from the origin or
+  relations to the part's own edges (wall end edge midpoints, bend tangent edges) in the rebuild.
+- Feature/mate/instance names: rename at the end (temp names first to avoid collisions);
+  mirrored instance numbers are renamed to match.
