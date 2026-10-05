@@ -38,7 +38,8 @@ _STATUS = {1: "unknown", 2: "under_defined", 3: "fully_defined", 4: "over_define
            5: "no_solution", 6: "invalid_solution", 7: "autosolve_off"}
 _SEG_TYPES = {0: "line", 1: "arc", 2: "ellipse", 3: "spline", 4: "text", 5: "parabola"}
 _DIM_TYPES = {0: "unknown", 1: "ordinate", 2: "linear", 3: "angular", 4: "arc_length",
-              5: "radius", 6: "diameter", 7: "hor_ordinate", 8: "vert_ordinate"}
+              5: "radius", 6: "diameter", 7: "hor_ordinate", 8: "vert_ordinate",
+              11: "horizontal", 12: "vertical"}
 # swConstraintType_e (read from swconst.tlb, SW 2025) — the ones a person uses in sketches
 _REL = {"distance": 1, "angle": 2, "radius": 3, "horizontal": 4, "vertical": 5, "tangent": 6,
         "parallel": 7, "perpendicular": 8, "coincident": 9, "concentric": 10, "symmetric": 11,
@@ -179,7 +180,76 @@ def _describe_entity(ent, etype, maps, sk):
     return f"ext:type{etype}"
 
 
-def _read_sketch(sketch_name):
+def _sketch_summary(sketch_name):
+    """Cheap status for big sketches: counts only, no per-entity description (read_sketch on a
+    64-slot sketch takes minutes because every relation entity is resolved)."""
+    app, doc = sw_w._active_part()
+    feat, sk = _sketch(doc, sketch_name)
+    seg_types: dict = {}
+    loose_segs, loose_pts, n_loose_segs, n_loose_pts = [], [], 0, 0
+    for i, s in enumerate(slip._inv(sk, "GetSketchSegments") or ()):
+        t = _SEG_TYPES.get(int(slip._inv(s, "GetType")), "other")
+        k = t + (" (construction)" if bool(slip._inv(s, "ConstructionGeometry")) else "")
+        seg_types[k] = seg_types.get(k, 0) + 1
+        try:
+            st = int(slip._inv(s, "Status"))            # swConstrainedStatus_e per segment
+        except Exception:  # noqa: BLE001
+            st = 3
+        if st != 3:
+            n_loose_segs += 1
+            if len(loose_segs) < 24:
+                row = {"key": f"S{i}", "type": k, "status": _STATUS.get(st, str(st))}
+                try:
+                    a = _pt_xy(slip._inv(s, "GetStartPoint2"))
+                    b = _pt_xy(slip._inv(s, "GetEndPoint2"))
+                    row["mid"] = _r([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2])
+                except Exception:  # noqa: BLE001
+                    pass
+                loose_segs.append(row)
+    pts = list(slip._inv(sk, "GetSketchPoints2") or ())
+    n_pts = len(pts)
+    for i, p in enumerate(pts):
+        try:
+            st = int(slip._inv(p, "Status"))
+        except Exception:  # noqa: BLE001
+            st = 3
+        if st != 3:
+            n_loose_pts += 1
+            if len(loose_pts) < 24:
+                loose_pts.append({"key": f"P{i}", "xy": _r(_pt_xy(p)), "status": _STATUS.get(st, str(st))})
+    rel_types: dict = {}
+    try:
+        rm = slip._inv(sk, "RelationManager")
+        for r in slip._inv(rm, "GetRelations", 0) or ():
+            n = _rel_name(int(slip._inv(r, "GetRelationType")))
+            rel_types[n] = rel_types.get(n, 0) + 1
+    except Exception as ex:  # noqa: BLE001
+        rel_types["error"] = str(ex)[:120]
+    dims = []
+    dd = slip._inv(feat, "GetFirstDisplayDimension")
+    guard = 0
+    while dd is not None and guard < 500:
+        guard += 1
+        try:
+            d = slip._inv(dd, "GetDimension2", 0)
+            t = int(slip._inv(dd, "Type2"))
+            v = float(slip._inv(d, "SystemValue"))
+            dims.append({"name": str(slip._inv(d, "Name")), "type": _DIM_TYPES.get(t, str(t)),
+                         "value_mm_or_deg": round(math.degrees(v), 4) if t == 3 else round(v * _MM, 4)})
+        except Exception as ex:  # noqa: BLE001
+            dims.append({"error": str(ex)[:80]})
+        dd = slip._inv(feat, "GetNextDisplayDimension", dd)
+    status = int(slip._inv(sk, "GetConstrainedStatus"))
+    return {"status": "done", "sketch": sketch_name, "constrained": _STATUS.get(status, str(status)),
+            "segments": seg_types, "points": n_pts, "relations": rel_types,
+            "not_fully_defined": {"segments": n_loose_segs, "points": n_loose_pts,
+                                  "first_segments": loose_segs, "first_points": loose_pts},
+            "relation_count": sum(v for k, v in rel_types.items() if k != "error"), "dimensions": dims}
+
+
+def _read_sketch(sketch_name, summary=False):
+    if summary:
+        return _sketch_summary(sketch_name)
     app, doc = sw_w._active_part()
     feat, sk = _sketch(doc, sketch_name)
     segs = _segments(sk)
@@ -299,6 +369,25 @@ def _select_by_id(doc, name, typ, xyz_m, append=False, mark=0):
                           float(xyz_m[2]), append, int(mark), _null_dispatch(), 0))
 
 
+def _closest_model_edge(doc, xyz_m, tol_m=0.0005):
+    """Model edge geometrically closest to a point (IEdge.GetClosestPointOn over every body)."""
+    best, bd = None, float("inf")
+    try:
+        bodies = list(slip._inv(doc, "GetBodies2", 0, True) or ())
+    except Exception:  # noqa: BLE001
+        return None
+    for b in bodies:
+        for e in list(slip._inv(b, "GetEdges") or ()):
+            try:
+                r = slip._inv(e, "GetClosestPointOn", xyz_m[0], xyz_m[1], xyz_m[2])
+                d = math.dist([float(r[0]), float(r[1]), float(r[2])], xyz_m)
+            except Exception:  # noqa: BLE001
+                continue
+            if d < bd:
+                best, bd = e, d
+    return best if bd <= tol_m else None
+
+
 def _grab_selected(doc, name, typ, xyz_m):
     """Select one entity by name/type/point, return the object, leave the selection empty."""
     slip._inv(doc, "ClearSelection2", True)
@@ -327,7 +416,9 @@ def _resolve(ref, segs, pts, ctx):
         return ("obj", o, f"plane:{ref['plane']}")
     if isinstance(ref, dict) and "edge" in ref:
         xyz = [v / _MM for v in ref["edge"]]
-        o = _grab_selected(doc, "", "EDGE", xyz)
+        o = _closest_model_edge(doc, xyz)          # geometric, not a view ray pick
+        if o is None:
+            o = _grab_selected(doc, "", "EDGE", xyz)
         if o is None:
             raise SWError(f"no model edge at {ref['edge']} mm")
         return ("obj", o, f"edge@{ref['edge']}")
@@ -380,7 +471,26 @@ def _open_sketch(doc, feat):
     slip._inv(doc, "EditSketch")
 
 
-def _define_sketch(sketch_name, relations, dimensions):
+def _remove_dangling_relations(rm) -> int:
+    """Delete vertical/horizontal relations left with a single point (what AddRelation makes when
+    asked for VERTICAL/HORIZONTAL on two points) — they constrain nothing and clutter the sketch."""
+    n = 0
+    try:
+        for r in list(slip._inv(rm, "GetRelations", 0) or ()):
+            t = int(slip._inv(r, "GetRelationType"))
+            if t not in (4, 5):
+                continue
+            ents = list(slip._inv(r, "GetEntities") or ())
+            types = list(slip._inv(r, "GetEntitiesType") or ())
+            if len(ents) == 1 and types and int(types[0]) == 2:      # swSketchRelationEntityType_Point
+                if slip._inv(rm, "DeleteRelation", r):
+                    n += 1
+    except Exception as ex:  # noqa: BLE001
+        logger.info("dangling relation cleanup: %s", ex)
+    return n
+
+
+def _define_sketch(sketch_name, relations, dimensions, report="full"):
     app, doc = sw_w._active_part()
     feat, sk = _sketch(doc, sketch_name)
     _open_sketch(doc, feat)
@@ -395,6 +505,12 @@ def _define_sketch(sketch_name, relations, dimensions):
         try:
             resolved = [_resolve(e, segs, pts, ctx) for e in rel.get("entities", [])]
             labels = [r[2] for r in resolved]
+            # vertical/horizontal between POINTS is swConstraintType VERTPOINTS/HORIZPOINTS (26/25);
+            # AddRelation(points, VERTICAL) keeps only the first point (a dangling 1-point relation)
+            if rtype in ("vertical", "horizontal") and len(resolved) >= 2 and all(
+                    isinstance(e, (dict, str)) and (e == "origin" or (isinstance(e, dict) and "pt" in e))
+                    for e in rel.get("entities", [])):
+                rtype = rtype + "_points"
             ok = False
             if all(r[0] == "obj" for r in resolved) and rtype in _REL:
                 try:
@@ -463,6 +579,7 @@ def _define_sketch(sketch_name, relations, dimensions):
                 slip._inv(app, "SetUserPreferenceToggle", 10, toggle_prev)
             except Exception:  # noqa: BLE001
                 pass
+    removed = _remove_dangling_relations(rm)
     skm = slip._inv(doc, "SketchManager")
     try:
         slip._inv(skm, "InsertSketch", True)
@@ -472,24 +589,125 @@ def _define_sketch(sketch_name, relations, dimensions):
         slip._inv(doc, "EditRebuild3")
     except Exception:  # noqa: BLE001
         pass
+    if removed:
+        done.append({"removed_dangling_relations": removed})
+    if report == "summary":
+        after = _sketch_summary(sketch_name)
+        return {"status": "done", "sketch": sketch_name, "constrained": after["constrained"],
+                "applied_count": len(done), "failed": failed, "relations": after["relations"],
+                "relation_count": after["relation_count"], "dimension_count": len(after["dimensions"]),
+                "not_fully_defined": after["not_fully_defined"],
+                **sw_w._body_report(doc)}
     after = _read_sketch(sketch_name)
     return {"status": "done", "sketch": sketch_name, "constrained": after["constrained"],
             "applied": done, "failed": failed, "relations": after["relations"],
             "dimensions": after["dimensions"], **sw_w._body_report(doc)}
 
 
+def _ent_key(obj):
+    """(kind, id) for a sketch entity — segment and point ids are separate number spaces."""
+    i = _id(obj)
+    try:
+        slip._inv(obj, "GetType")
+        kind = "seg"
+    except Exception:  # noqa: BLE001
+        kind = "pt"
+    try:                                    # sketch points expose X; segments do not
+        float(slip._inv(obj, "X"))
+        kind = "pt"
+    except Exception:  # noqa: BLE001
+        pass
+    return (kind, i)
+
+
+def _cleanup_sketch(sketch_name, delete_entities, delete_relations, report="summary"):
+    """Delete sketch segments and specific relations from a sketch of the ACTIVE part."""
+    app, doc = sw_w._active_part()
+    feat, sk = _sketch(doc, sketch_name)
+    _open_sketch(doc, feat)
+    feat, sk = _sketch(doc, sketch_name)
+    segs, pts = _segments(sk), _points(sk)
+    ctx = {"doc": doc, "app": app, "sk": sk}
+    rm = slip._inv(sk, "RelationManager")
+    done, failed = [], []
+    # relations first (entity deletion would take its relations with it anyway)
+    for spec in delete_relations or ():
+        try:
+            want_type = str(spec.get("type", "")).lower()
+            resolved = [_resolve(e, segs, pts, ctx) for e in spec.get("entities", [])]
+            want = sorted(str(_ent_key(r[1])) for r in resolved if r[0] == "obj")
+            hit = 0
+            for r in list(slip._inv(rm, "GetRelations", 0) or ()):
+                if _rel_name(int(slip._inv(r, "GetRelationType"))) != want_type:
+                    continue
+                ents = list(slip._inv(r, "GetEntities") or ())
+                if want and sorted(str(_ent_key(e)) for e in ents) != want:
+                    continue
+                if slip._inv(rm, "DeleteRelation", r):
+                    hit += 1
+                    break
+            (done if hit else failed).append({"relation": want_type,
+                                              "entities": [r[2] for r in resolved], "deleted": hit})
+        except Exception as ex:  # noqa: BLE001
+            failed.append({"relation": spec, "error": str(ex)[:160]})
+    if delete_entities:
+        try:
+            resolved = [_resolve(e, segs, pts, ctx) for e in delete_entities]
+            slip._inv(doc, "ClearSelection2", True)
+            ok = all(_select(doc, app, sk, r, True) for r in resolved)
+            if not ok:
+                raise SWError("could not select " + ", ".join(r[2] for r in resolved))
+            slip._inv(doc, "EditDelete")
+            done.append({"deleted_entities": [r[2] for r in resolved]})
+        except Exception as ex:  # noqa: BLE001
+            failed.append({"entities": delete_entities, "error": str(ex)[:160]})
+    removed = _remove_dangling_relations(rm)
+    if removed:
+        done.append({"removed_dangling_relations": removed})
+    skm = slip._inv(doc, "SketchManager")
+    try:
+        slip._inv(skm, "InsertSketch", True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        slip._inv(doc, "EditRebuild3")
+    except Exception:  # noqa: BLE001
+        pass
+    after = _read_sketch(sketch_name, summary=(report == "summary"))
+    return {"status": "done", "sketch": sketch_name, "applied": done, "failed": failed, "after": after}
+
+
+def _delete_feature(feature_name, with_children=False):
+    app, doc = sw_w._active_part()
+    feat = sw_w._feature(doc, feature_name)
+    skm = slip._inv(doc, "SketchManager")
+    if slip._inv(skm, "ActiveSketch") is not None:
+        slip._inv(skm, "InsertSketch", True)
+    slip._inv(doc, "ClearSelection2", True)
+    if not bool(slip._inv(feat, "Select2", False, 0)):
+        raise SWError(f"could not select {feature_name!r}")
+    ext = slip._inv(doc, "Extension")
+    # swDeleteSelectionOptions_e: swDelete_Absorbed 1, swDelete_Children 2
+    ok = bool(slip._inv(ext, "DeleteSelection2", 1 | (2 if with_children else 0)))
+    slip._inv(doc, "EditRebuild3")
+    return {"status": "done" if ok else "failed", "feature": feature_name, **sw_w._body_report(doc)}
+
+
 def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
 
     @mcp.tool()
-    async def read_sketch(sketch_name: str) -> str:
+    async def read_sketch(sketch_name: str, summary: bool = False) -> str:
         """Read how a sketch of the ACTIVE part is defined: segments (S<i>) and points (P<i>) with
         geometry in sketch mm, every relation with the entities it binds (keys, 'origin', planes,
         model edges), every dimension (value, type, attached entities, text position) and the
-        constrained status (fully_defined / under_defined / over_defined). Read-only."""
-        return await slip_tube._run(sw, "read_sketch", _read_sketch, sketch_name)
+        constrained status (fully_defined / under_defined / over_defined). Read-only.
+        summary=true: only counts (segments by type, points, relations by type), dimension values
+        and the constrained status — fast on big sketches (dozens of slots / holes)."""
+        return await slip_tube._run(sw, "read_sketch", _read_sketch, sketch_name, summary)
 
     @mcp.tool()
-    async def define_sketch(sketch_name: str, relations: str = "[]", dimensions: str = "[]") -> str:
+    async def define_sketch(sketch_name: str, relations: str = "[]", dimensions: str = "[]",
+                            report: str = "full") -> str:
         """Add relations and dimensions to a sketch of the ACTIVE part so it becomes fully defined.
         Entity refs (sketch coordinates, mm): {"seg": [x, y]} closest segment (add
         "construction": true/false to restrict), {"pt": [x, y]} closest sketch point, "origin",
@@ -500,6 +718,25 @@ def register_tools(mcp: FastMCP, sw: SWConnection) -> None:
         "entities": [refs] (or "seg": [x, y] for length/diameter/radius), "orient":
         "horizontal"|"vertical"|"aligned" (linear only), "text": [x, y] text position in sketch mm,
         optional "value_mm" / "value_deg" to drive a new value}.
+        report: "full" (every relation and dimension after) or "summary" (counts, failures and
+        the constrained status only — use it on big sketches, the full report can take minutes).
         Returns what was applied, what failed and the sketch's constrained status after."""
         return await slip_tube._run(sw, "define_sketch", _define_sketch, sketch_name,
-                                    json.loads(relations), json.loads(dimensions))
+                                    json.loads(relations), json.loads(dimensions), report)
+
+    @mcp.tool()
+    async def cleanup_sketch(sketch_name: str, delete_entities: str = "[]",
+                             delete_relations: str = "[]", report: str = "summary") -> str:
+        """Remove things from a sketch of the ACTIVE part: delete_entities = JSON refs like
+        define_sketch's ({"seg": [x, y], "construction": true}, {"pt": [x, y]}); delete_relations =
+        JSON list of {"type": name as read_sketch shows it (samelength, vertical, vertpoints, ...),
+        "entities": [refs]} — the relation of that type binding exactly those entities is deleted.
+        Also removes dangling one-point vertical/horizontal relations. report: summary | full."""
+        return await slip_tube._run(sw, "cleanup_sketch", _cleanup_sketch, sketch_name,
+                                    json.loads(delete_entities), json.loads(delete_relations), report)
+
+    @mcp.tool()
+    async def delete_feature(feature_name: str, with_children: bool = False) -> str:
+        """Delete a feature of the ACTIVE part by name (absorbed sketches go with it;
+        with_children also deletes dependent features). Returns the body report."""
+        return await slip_tube._run(sw, "delete_feature", _delete_feature, feature_name, with_children)
