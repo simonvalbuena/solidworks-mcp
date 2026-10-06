@@ -36,6 +36,7 @@ _TOL = 2e-6                      # m — coincidence tolerance in model space
 
 # relation types re-created by dimensions (skip) and the slot bookkeeping ones
 _DIM_RELS = {1, 2, 3, 15, 41, 43, 44, 84}
+_CTX: dict = {}
 _SKIP_RELS = {73, 74, 32}        # FAKESLOT / FIXEDSLOT / USEEDGE (handled separately)
 
 
@@ -70,6 +71,21 @@ def _vec(a):
 
 
 def _xf_apply(app, xf, p):
+    """Apply a SolidWorks MathTransform (as its 16-value ArrayData list, or the COM object) to a
+    point: p' = (p . R) * scale + t, R row-major in ArrayData[0:9] (rows = images of x, y, z)."""
+    a = xf if isinstance(xf, list) else _arr(xf)
+    x, y, z = float(p[0]), float(p[1]), float(p[2])
+    sc = a[12] if len(a) > 12 and a[12] else 1.0
+    return [(x * a[0] + y * a[3] + z * a[6]) * sc + a[9],
+            (x * a[1] + y * a[4] + z * a[7]) * sc + a[10],
+            (x * a[2] + y * a[5] + z * a[8]) * sc + a[11]]
+
+
+def _arr(xf):
+    return [float(v) for v in list(slip._inv(xf, "ArrayData"))]
+
+
+def _xf_apply_com(app, xf, p):
     mu = slip._inv(app, "GetMathUtility")
     pt = slip._inv(mu, "CreatePoint", sw_s._doubles([p[0], p[1], p[2]]))
     a = slip._inv(slip._inv(pt, "MultiplyTransform", xf), "ArrayData")
@@ -77,11 +93,11 @@ def _xf_apply(app, xf, p):
 
 
 def _s2m(app, sk):
-    return slip._inv(slip._inv(sk, "ModelToSketchTransform"), "Inverse")
+    return _arr(slip._inv(slip._inv(sk, "ModelToSketchTransform"), "Inverse"))
 
 
 def _m2s(sk):
-    return slip._inv(sk, "ModelToSketchTransform")
+    return _arr(slip._inv(sk, "ModelToSketchTransform"))
 
 
 def _pt_model(app, s2m, p):
@@ -93,6 +109,32 @@ def _try(f, default=None):
         return f()
     except Exception:  # noqa: BLE001
         return default
+
+
+_DISP: dict = {}
+
+
+def _q(obj, name, *args, k=""):
+    """Raw COM invoke (no re-wrapping, which costs several round-trips per object) with the DISPID
+    cached per object kind k (objects of one kind share one interface)."""
+    ole = getattr(obj, "_oleobj_", obj)
+    d = _DISP.get((k, name)) if k else None
+    if d is None:
+        d = ole.GetIDsOfNames(0, name)
+        if k:
+            _DISP[(k, name)] = d
+    return ole.Invoke(d, 0, 3, True, *args)
+
+
+def _qid(obj, k):
+    try:
+        return tuple(int(x) for x in _q(obj, "GetID", k=k))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _qxy(p):
+    return float(_q(p, "X", k="pt")), float(_q(p, "Y", k="pt"))
 
 
 def _ftype(feat):
@@ -195,40 +237,92 @@ def _point_on_face(f):
 
 # --------------------------------------------------------------------------- source sketch reading
 
-def _classify(ent, sk, seg_ids, pt_ids):
+# swSketchRelationEntityTypes_e -> kind / sketch segment type
+_REL_KIND = {2: ("pt", None), 3: ("seg", 0), 4: ("seg", 1), 5: ("seg", 2), 6: ("seg", 5), 7: ("seg", 3),
+             9: ("seg", 4), 10: ("plane", None), 11: ("face", None), 12: ("face", None), 13: ("face", None)}
+# swSelectType_e of dimension attachments -> kind
+_SEL_KIND = {1: ("edge", None), 2: ("face", None), 3: ("vertex", None), 4: ("plane", None),
+             9: ("seg", None), 11: ("pt", None), 25: ("pt", None), 24: ("seg", None)}
+
+
+def _classify(ent, sk, seg_ids, pt_ids, hint=None):
     """-> ('seg', i) | ('pt', i) | ('origin',) | ('edge', xyz) | ('face', xyz) | ('vertex', xyz) |
-    ('plane', name) | ('sketchpt', sketch_name, xyz) | ('sketchseg', sketch_name, xyz) | ('ext', why)"""
-    is_point = _try(lambda: float(slip._inv(ent, "X")) is not None, False)
-    owner = _try(lambda: slip._inv(ent, "GetSketch"))
+    ('plane', name) | ('sketchpt', sketch_name, xyz) | ('sketchseg', sketch_name, xyz) | ('ext', why)
+    hint = (kind, segment type) from the relation / annotation entity type (saves COM probing)."""
+    kind, stype = hint if hint else (None, None)
+    if kind in ("edge", "face", "vertex", "plane"):
+        owner = None
+        is_point = False
+    else:
+        is_point = kind == "pt" if kind else _try(lambda: float(slip._inv(ent, "X")) is not None, False)
+        kk = "pt" if is_point else (f"seg{stype}" if stype is not None else "")
+        owner = _try(lambda: _q(ent, "GetSketch"))           # uncached: may be a model edge
     if owner is not None:
         local = sw_s._same(owner, sk)
-        i = sw_s._id(ent)
+        i = _qid(ent, kk) if kk else sw_s._id(ent)
         if local and i is not None:
             if is_point and i in pt_ids:
                 return ("pt", pt_ids[i])
             if not is_point:
-                t = _try(lambda: int(slip._inv(ent, "GetType")))
+                t = stype if stype is not None else _try(lambda: int(slip._inv(ent, "GetType")))
                 if t is not None and (t,) + i in seg_ids:
                     return ("seg", seg_ids[(t,) + i])
+                if stype is not None:                       # hint may be off (circle vs arc): ask
+                    t = _try(lambda: int(_q(ent, "GetType", k="seg")))
+                    if t is not None and (t,) + i in seg_ids:
+                        return ("seg", seg_ids[(t,) + i])
+        owner = slip._wrap(owner)
+        ent = slip._wrap(ent)
         # a point / segment of another sketch of this part (origin sketch included)
-        of = _try(lambda: slip._inv(owner, "QueryInterface"))  # noqa: F841  (late binding probe)
-        oname, otype = None, None
-        try:
-            ofeat = owner                                     # ISketch is also an IFeature
-            oname = str(slip._inv(ofeat, "Name"))
-            otype = str(slip._inv(ofeat, "GetTypeName2"))
-        except Exception:  # noqa: BLE001
-            pass
+        if local and is_point:
+            x, y = float(slip._inv(ent, "X")), float(slip._inv(ent, "Y"))
+            if abs(x) < 1e-9 and abs(y) < 1e-9:
+                return ("origin",)
+            return ("vertex", _xf_apply(_CTX["app"], _CTX["s2m"], [x, y, 0.0]))
+        if local and not is_point:
+            # a model edge projected into this sketch (convert-entities source, midpoint targets)
+            try:
+                a = slip._inv(ent, "GetStartPoint2")
+                b = slip._inv(ent, "GetEndPoint2")
+                pa = _xf_apply(_CTX["app"], _CTX["s2m"], [float(slip._inv(a, "X")), float(slip._inv(a, "Y")), 0.0])
+                pb = _xf_apply(_CTX["app"], _CTX["s2m"], [float(slip._inv(b, "X")), float(slip._inv(b, "Y")), 0.0])
+                if math.dist(pa, pb) > 1e-9:
+                    return ("edge", [(pa[k] + pb[k]) / 2 for k in range(3)])
+                c = slip._inv(ent, "GetCenterPoint2")
+                r = float(slip._inv(ent, "GetRadius"))
+                cc = [float(slip._inv(c, "X")) + r, float(slip._inv(c, "Y")), 0.0]
+                return ("edge", _xf_apply(_CTX["app"], _CTX["s2m"], cc))
+            except Exception as ex:  # noqa: BLE001
+                return ("ext", f"projected segment ({str(ex)[:40]})")
+        osk = _CTX.get("origin_sketch")
+        if is_point and osk is not None and _is_same(_CTX.get("app"), owner, osk):
+            return ("origin",)
+        oname = None
+        for n_, spec_ in _CTX.get("sketch_feats", []):
+            if _is_same(_CTX.get("app"), owner, spec_):
+                oname = n_
+                break
         if is_point:
             x, y = float(slip._inv(ent, "X")), float(slip._inv(ent, "Y"))
-            if otype == "OriginProfileFeature" or (oname is None and abs(x) < 1e-9 and abs(y) < 1e-9):
-                return ("origin",)
             if oname:
                 return ("sketchpt", oname, [x, y])
         elif oname:
             return ("sketchseg", oname, None)
         return ("ext", "foreign sketch entity")
     # model entities: edge / face / vertex / plane
+    if kind == "plane":
+        n = _try(lambda: str(slip._inv(ent, "Name")))
+        if n:
+            return ("plane", n)
+        for f in _features(_CTX["sdoc"]):
+            if _ftype(f) == "RefPlane":
+                spec = _try(lambda f=f: slip._inv(f, "GetSpecificFeature2"))
+                if spec is not None and _is_same(_CTX["app"], spec, ent):
+                    return ("plane", _fname(f))
+    if kind == "face":
+        return ("face", _point_on_face(ent))
+    if kind == "vertex":
+        return ("vertex", [float(v) for v in list(slip._inv(ent, "GetPoint"))[:3]])
     if _try(lambda: slip._inv(ent, "GetCurveParams2")) is not None:
         return ("edge", _point_on_edge(ent))
     if _try(lambda: slip._inv(ent, "GetSurface")) is not None:
@@ -242,50 +336,82 @@ def _classify(ent, sk, seg_ids, pt_ids):
     return ("ext", "unknown entity")
 
 
+def _is_same(app, a, b):
+    try:
+        return int(slip._inv(app, "IsSame", a, b)) == 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _origin_sketch(doc):
+    for f in _features(doc):
+        if _ftype(f) == "OriginProfileFeature":
+            return _try(lambda f=f: slip._inv(f, "GetSpecificFeature2"))
+    return None
+
+
 def _read_sketch(app, sdoc, sketch_name):
+    import time
+    t0 = time.time()
     feat = sw_w._feature(sdoc, sketch_name)
     sk = slip._inv(feat, "GetSpecificFeature2")
+    _CTX["origin_sketch"] = _origin_sketch(sdoc)
+    _CTX["s2m"] = _s2m(app, sk)
+    _CTX["sdoc"] = sdoc
+    _CTX["sketch_feats"] = [(_fname(f), _try(lambda f=f: slip._inv(f, "GetSpecificFeature2")))
+                            for f in _features(sdoc) if _ftype(f) == "ProfileFeature"]
+    _CTX["app"] = app
     s2m = _s2m(app, sk)
-    segs = list(slip._inv(sk, "GetSketchSegments") or ())
-    pts = list(slip._inv(sk, "GetSketchPoints2") or ())
+    segs = list(_q(sk, "GetSketchSegments") or ())
+    pts = list(_q(sk, "GetSketchPoints2") or ())
     seg_ids, pt_ids = {}, {}
-    for i, s in enumerate(segs):
-        sid = sw_s._id(s)
+    stypes = []
+    for i, s_ in enumerate(segs):
+        t = int(_q(s_, "GetType", k="seg"))
+        stypes.append(t)
+        sid = _qid(s_, f"seg{t}")
         if sid is not None:
-            seg_ids[(int(slip._inv(s, "GetType")),) + sid] = i
+            seg_ids[(t,) + sid] = i
     for i, p in enumerate(pts):
-        pid = sw_s._id(p)
+        pid = _qid(p, "pt")
         if pid is not None:
             pt_ids[pid] = i
-    P = [_pt_model(app, s2m, p) for p in pts]
+    P = []
+    for p in pts:
+        x, y = _qxy(p)
+        P.append(_xf_apply(app, s2m, [x, y, 0.0]))
 
     def pidx(p):
-        pid = sw_s._id(p)
+        pid = _qid(p, "pt")
         if pid in pt_ids:
             return pt_ids[pid]
-        xyz = _pt_model(app, s2m, p)
+        x, y = _qxy(p)
+        xyz = _xf_apply(app, s2m, [x, y, 0.0])
         return min(range(len(P)), key=lambda k: math.dist(P[k], xyz)) if P else None
 
+    T = {"points": round(time.time() - t0, 2)}
     rows = []
-    for i, s in enumerate(segs):
-        t = int(slip._inv(s, "GetType"))
-        row = {"i": i, "type": t, "constr": bool(slip._inv(s, "ConstructionGeometry"))}
+    for i, s_ in enumerate(segs):
+        t = stypes[i]
+        kk = f"seg{t}"
+        row = {"i": i, "type": t, "constr": bool(_q(s_, "ConstructionGeometry", k=kk))}
         if t == 0:
-            row["a"] = pidx(slip._inv(s, "GetStartPoint2"))
-            row["b"] = pidx(slip._inv(s, "GetEndPoint2"))
+            row["a"] = pidx(_q(s_, "GetStartPoint2", k=kk))
+            row["b"] = pidx(_q(s_, "GetEndPoint2", k=kk))
         elif t == 1:
-            row["c"] = pidx(slip._inv(s, "GetCenterPoint2"))
-            row["a"] = pidx(slip._inv(s, "GetStartPoint2"))
-            row["b"] = pidx(slip._inv(s, "GetEndPoint2"))
-            row["r"] = float(slip._inv(s, "GetRadius"))
+            row["c"] = pidx(_q(s_, "GetCenterPoint2", k=kk))
+            row["a"] = pidx(_q(s_, "GetStartPoint2", k=kk))
+            row["b"] = pidx(_q(s_, "GetEndPoint2", k=kk))
+            row["r"] = float(_q(s_, "GetRadius", k=kk))
             row["circle"] = row["a"] == row["b"] or math.dist(P[row["a"]], P[row["b"]]) < 1e-9
-            row["dir"] = int(_try(lambda s=s: slip._inv(s, "GetRotationDir"), 1) or 1)
+            row["dir"] = int(_try(lambda s_=s_: _q(s_, "GetRotationDir", k=kk), 1) or 1)
         elif t == 4:
-            c = list(slip._inv(s, "GetCoordinates"))[:3]
+            s_w = slip._wrap(s_)
+            c = list(slip._inv(s_w, "GetCoordinates"))[:3]
             row["xyz"] = _xf_apply(app, s2m, c)
-            row["text"] = str(slip._inv(s, "Text"))
-            row["fmt"] = slip._inv(s, "GetTextFormat")
-            row["doc_fmt"] = bool(_try(lambda s=s: slip._inv(s, "GetUseDocTextFormat"), False))
+            row["text"] = str(slip._inv(s_w, "Text"))
+            row["fmt"] = slip._inv(s_w, "GetTextFormat")
+            row["doc_fmt"] = bool(_try(lambda: slip._inv(s_w, "GetUseDocTextFormat"), False))
         else:
             row["unsupported"] = True
         rows.append(row)
@@ -295,13 +421,18 @@ def _read_sketch(app, sdoc, sketch_name):
             if r.get(k) is not None:
                 used.add(r[k])
     lone = [k for k in range(len(pts)) if k not in used]
+    T["segments"] = round(time.time() - t0, 2)
     rels = []
-    rm = slip._inv(sk, "RelationManager")
-    for r in list(slip._inv(rm, "GetRelations", 0) or ()):
-        t = int(slip._inv(r, "GetRelationType"))
-        ents = list(slip._inv(r, "GetEntities") or ())
+    rm = _q(sk, "RelationManager")
+    for r in list(_q(rm, "GetRelations", 0) or ()):
+        t = int(_q(r, "GetRelationType", k="rel"))
+        ents = list(_q(r, "GetEntities", k="rel") or ())
+        etypes = list(_try(lambda r=r: _q(r, "GetEntitiesType", k="rel"), ()) or ())
         rels.append({"type": t, "name": sw_s._rel_name(t),
-                     "ents": [_classify(e, sk, seg_ids, pt_ids) for e in ents]})
+                     "ents": [_classify(e, sk, seg_ids, pt_ids,
+                                        _REL_KIND.get(int(etypes[k])) if k < len(etypes) else None)
+                              for k, e in enumerate(ents)]})
+    T["relations"] = round(time.time() - t0, 2)
     dims = []
     dd = slip._inv(feat, "GetFirstDisplayDimension")
     guard = 0
@@ -310,31 +441,37 @@ def _read_sketch(app, sdoc, sketch_name):
         d = slip._inv(dd, "GetDimension2", 0)
         ann = slip._inv(dd, "GetAnnotation")
         ents = list(slip._inv(ann, "GetAttachedEntities3") or ())
+        atypes = list(_try(lambda ann=ann: slip._inv(ann, "GetAttachedEntityTypes"), ()) or ())
         dims.append({"type": int(slip._inv(dd, "Type2")), "value": float(slip._inv(d, "SystemValue")),
                      "driven": int(_try(lambda d=d: slip._inv(d, "DrivenState"), 2) or 2) == 1,
                      "pos": _vec(list(slip._inv(ann, "GetPosition"))[:3]),
                      "name": str(slip._inv(d, "Name")),
-                     "ents": [_classify(e, sk, seg_ids, pt_ids) for e in ents]})
+                     "ents": [_classify(e, sk, seg_ids, pt_ids,
+                                        _SEL_KIND.get(int(atypes[k])) if k < len(atypes) else None)
+                              for k, e in enumerate(ents)]})
         dd = slip._inv(feat, "GetNextDisplayDimension", dd)
     slots = []
     for sl in list(_try(lambda: slip._inv(sk, "GetSketchSlots")) or ()):
         c = _try(lambda sl=sl: slip._inv(sl, "GetCenterPoint"))
-        slots.append({"center": pidx(c) if c is not None else None})
+        slots.append({"center": _try(lambda c=c: pidx(c)) if c is not None else None})
     # plane / face the sketch lies on
-    ref = _try(lambda: slip._inv(sk, "GetReferenceEntity", 0))
-    if isinstance(ref, tuple):
-        ref = ref[0]
     plane = None
+    ref, rtype = _try(lambda: _ref_entity(sk), (None, None))
     if ref is not None:
-        n = _try(lambda: str(slip._inv(ref, "Name")))
-        if n:
-            plane = ("plane", n)
-        elif _try(lambda: slip._inv(ref, "GetSurface")) is not None:
+        if _try(lambda: slip._inv(ref, "GetSurface")) is not None:
             plane = ("face", _point_on_face(ref))
         else:
-            # IRefPlane: find its feature by comparing with the planes of the document
-            plane = ("refplane", None)
-    return {"name": sketch_name, "feat": feat, "sk": sk, "s2m": s2m, "P": P, "rows": rows,
+            for f in _features(sdoc):
+                if _ftype(f) != "RefPlane":
+                    continue
+                spec = _try(lambda f=f: slip._inv(f, "GetSpecificFeature2"))
+                if spec is not None and (_is_same(app, spec, ref) or _is_same(app, f, ref)):
+                    plane = ("plane", _fname(f))
+                    break
+            if plane is None:
+                plane = ("unresolved", rtype)
+    T["total"] = round(time.time() - t0, 2)
+    return {"timing": T, "name": sketch_name, "feat": feat, "sk": sk, "s2m": s2m, "P": P, "rows": rows,
             "lone": lone, "rels": rels, "dims": dims, "slots": slots, "plane": plane,
             "x_axis": _sub(_xf_apply(app, s2m, [1, 0, 0]), _xf_apply(app, s2m, [0, 0, 0])),
             "y_axis": _sub(_xf_apply(app, s2m, [0, 1, 0]), _xf_apply(app, s2m, [0, 0, 0]))}
@@ -422,11 +559,40 @@ def _clone_sketch_into(app, tdoc, src, idx, cache):
     P = src["P"]
     TP = [_xf_apply(app, m2s, p) for p in P]              # target sketch coords (m)
     slip._put(skm, "AddToDB", True)
+    autosolve = _try(lambda: bool(slip._inv(skm, "AutoSolve")))
+    if autosolve is not None:
+        _try(lambda: slip._put(skm, "AutoSolve", False))
     tseg, report = {}, {"unsupported": [], "unmapped": [], "failed": []}
+    conv = {}
+    for rel in src["rels"]:
+        if rel["type"] == 32:
+            segs_ = [e[1] for e in rel["ents"] if e[0] == "seg"]
+            edges_ = [e[1] for e in rel["ents"] if e[0] == "edge"]
+            if segs_ and edges_:
+                conv[segs_[0]] = edges_[0]
+    report["converted"] = 0
     try:
         for r in src["rows"]:
             t = r["type"]
             obj = None
+            if r["i"] in conv:
+                edge = idx.edge(conv[r["i"]])
+                if edge is not None:
+                    slip._inv(tdoc, "ClearSelection2", True)
+                    if sw_s._select(tdoc, app, sk, ("obj", edge, ""), False):
+                        before = len(list(slip._inv(sk, "GetSketchSegments") or ()))
+                        _try(lambda: slip._inv(skm, "SketchUseEdge3", False, False))
+                        segs_now = list(slip._inv(sk, "GetSketchSegments") or ())
+                        slip._inv(tdoc, "ClearSelection2", True)
+                        if len(segs_now) > before:
+                            obj = segs_now[-1]
+                            report["converted"] += 1
+                if obj is not None:
+                    if r["constr"]:
+                        _try(lambda obj=obj: slip._put(obj, "ConstructionGeometry", True))
+                    tseg[r["i"]] = obj
+                    continue
+                report["unmapped"].append({"converted_edge": r["i"], "drawn_instead": True})
             if t == 0:
                 a, b = TP[r["a"]], TP[r["b"]]
                 obj = slip._inv(skm, "CreateLine", a[0], a[1], 0.0, b[0], b[1], 0.0)
@@ -458,26 +624,30 @@ def _clone_sketch_into(app, tdoc, src, idx, cache):
         slip._put(skm, "AddToDB", False)
     rm = slip._inv(sk, "RelationManager")
     # merge shared end / centre points: target segments made their own copies
-    tpts_all = list(slip._inv(sk, "GetSketchPoints2") or ())
+    def table():
+        return [(q,) + _qxy(q) for q in list(_q(sk, "GetSketchPoints2") or ())]
 
-    def tpts_at(p):
-        return [q for q in tpts_all
-                if math.hypot(float(slip._inv(q, "X")) - p[0], float(slip._inv(q, "Y")) - p[1]) < _TOL]
+    def at(tab, p):
+        return [q for q, x, y in tab if abs(x - p[0]) < _TOL and abs(y - p[1]) < _TOL]
+    tab = table()
     merged = 0
     for k in range(len(P)):
-        group = tpts_at(TP[k])
+        group = at(tab, TP[k])
         for q in group[1:]:
-            if slip._inv(rm, "AddRelation", sw_w._variant_dispatch_array([group[0], q]), 42) is not None:
+            if _try(lambda q=q: slip._inv(rm, "AddRelation", sw_w._variant_dispatch_array([group[0], q]), 42)) \
+                    is not None:
                 merged += 1
-    tpts_all = list(slip._inv(sk, "GetSketchPoints2") or ())
+    if merged:
+        tab = table()
     tpt = {}
     for k in range(len(P)):
-        g = tpts_at(TP[k])
+        g = at(tab, TP[k])
         if g:
             tpt[k] = g[0]
     report["merged_points"] = merged
     # relations
     applied = 0
+    pins: list = []
     for rel in src["rels"]:
         t = rel["type"]
         if t in _DIM_RELS or t in _SKIP_RELS:
@@ -487,6 +657,8 @@ def _clone_sketch_into(app, tdoc, src, idx, cache):
         objs = [_resolve_target(e, tdoc, idx, tseg, tpt, cache) for e in rel["ents"]]
         if any(o is None for o in objs):
             report["unmapped"].append({"relation": rel["name"], "entities": [str(e)[:60] for e in rel["ents"]]})
+            if t in (9, 12, 25, 26) and any(e[0] == "pt" for e in rel["ents"]):
+                pins.extend(e[1] for e in rel["ents"] if e[0] == "pt")
             continue
         tt = t
         if swap_hv:
@@ -500,6 +672,8 @@ def _clone_sketch_into(app, tdoc, src, idx, cache):
     # slot internals (implicit in the slot entity): tangents, equal arcs, centre point at middle
     if src["slots"]:
         report["slot_relations"] = _slot_internals(src, tseg, tpt, rm)
+    if autosolve is not None:
+        _try(lambda: slip._put(skm, "AutoSolve", True))
     # dimensions
     applied, toggle = 0, None
     try:
@@ -547,6 +721,8 @@ def _clone_sketch_into(app, tdoc, src, idx, cache):
             _try(lambda: slip._inv(app, "SetUserPreferenceToggle", 10, toggle))
     report["dimensions_applied"] = applied
     report["dimensions_source"] = len(src["dims"])
+    if pins:
+        report["pinned_points"] = _pin_points(app, tdoc, sk, rm, src, TP, tpt, pins, cache, swap_hv)
     report["relations_source"] = len([r for r in src["rels"] if r["type"] not in _DIM_RELS])
     removed = sw_s._remove_dangling_relations(rm)
     if removed:
@@ -561,6 +737,45 @@ def _clone_sketch_into(app, tdoc, src, idx, cache):
         pass
     report["constrained"] = sw_s._STATUS.get(status, str(status))
     return name, report
+
+
+def _pin_points(app, tdoc, sk, rm, src, TP, tpt, pins, cache, swap_hv):
+    """In-context references (points of other documents) can not be re-created: locate those points
+    from the origin instead — a horizontal and a vertical dimension, or a vertical / horizontal
+    alignment with an already located point on the same column / row (fewest dimensions)."""
+    origin = cache.get("origin") or sw_s._origin_point(tdoc)
+    cache["origin"] = origin
+    done_x, done_y, out = [], [], {"dims": 0, "aligned": 0, "failed": 0}
+    s2m = _s2m(app, sk)
+    toggle = _try(lambda: bool(slip._inv(app, "GetUserPreferenceToggle", 10)))
+    _try(lambda: slip._inv(app, "SetUserPreferenceToggle", 10, False))
+    seen = set()
+    for k in pins:
+        if k in seen or k not in tpt:
+            continue
+        seen.add(k)
+        x, y = TP[k][0], TP[k][1]
+        for axis, done in (("x", done_x), ("y", done_y)):
+            v = x if axis == "x" else y
+            mate = next((j for j in done if abs((TP[j][0] if axis == "x" else TP[j][1]) - v) < 1e-7), None)
+            if mate is not None:
+                t = 26 if axis == "x" else 25          # same x: vertical points; same y: horizontal points
+                ok = _try(lambda: slip._inv(rm, "AddRelation", sw_w._variant_dispatch_array([tpt[mate], tpt[k]]), t))
+                out["aligned" if ok is not None else "failed"] += 1
+            else:
+                slip._inv(tdoc, "ClearSelection2", True)
+                sw_s._select(tdoc, app, sk, ("obj", origin, ""), False)
+                sw_s._select(tdoc, app, sk, ("obj", tpt[k], ""), True)
+                off = 0.015
+                pos = _xf_apply(app, s2m, [x / 2 if axis == "x" else x + off, y + off if axis == "x" else y / 2, 0.0])
+                dd = slip._inv(tdoc, "AddHorizontalDimension2" if axis == "x" else "AddVerticalDimension2",
+                               pos[0], pos[1], pos[2])
+                slip._inv(tdoc, "ClearSelection2", True)
+                out["dims" if dd is not None else "failed"] += 1
+            done.append(k)
+    if toggle is not None:
+        _try(lambda: slip._inv(app, "SetUserPreferenceToggle", 10, toggle))
+    return out
 
 
 def _slot_internals(src, tseg, tpt, rm):
@@ -590,22 +805,31 @@ def _slot_internals(src, tseg, tpt, rm):
             if ln["a"] in ends or ln["b"] in ends:
                 add(ar["i"], ln["i"], 6)
     # pair arcs of one slot: arcs joined by the same two lines
+    slots_found = []
     for i, a1 in enumerate(arcs):
         for a2 in arcs[i + 1:]:
             l1 = {ln["i"] for ln in lines if not ln["constr"] and ({ln["a"], ln["b"]} & {a1["a"], a1["b"]})}
             l2 = {ln["i"] for ln in lines if not ln["constr"] and ({ln["a"], ln["b"]} & {a2["a"], a2["b"]})}
             if l1 and l1 == l2:
                 add(a1["i"], a2["i"], 14)
-                # centre point of the slot: middle of the construction line between the arc centres
+                cl_i = None
                 for cl in lines:
                     if cl["constr"] and {cl["a"], cl["b"]} == {a1["c"], a2["c"]}:
-                        for s in src["slots"]:
-                            c = s.get("center")
-                            if c is not None and c in tpt and math.dist(
-                                    P[c], [(P[a1["c"]][k] + P[a2["c"]][k]) / 2 for k in range(3)]) < 1e-7:
-                                if slip._inv(rm, "AddRelation", sw_w._variant_dispatch_array(
-                                        [tpt[c], tseg[cl["i"]]]), 12) is not None:
+                        cl_i = cl["i"]
+                        mid = [(P[a1["c"]][k] + P[a2["c"]][k]) / 2 for k in range(3)]
+                        for c in src["lone"]:
+                            if c in tpt and math.dist(P[c], mid) < 1e-7 and cl["i"] in tseg:
+                                if _try(lambda c=c, cl=cl: slip._inv(rm, "AddRelation", sw_w._variant_dispatch_array(
+                                        [tpt[c], tseg[cl["i"]]]), 12)) is not None:
                                     made += 1
+                slots_found.append((a1["i"], cl_i))
+    # 'same slots' between slots: equal end arcs and equal centre lines to the first slot
+    if any(r["type"] == 75 for r in src["rels"]) and slots_found:
+        m_arc, m_cl = slots_found[0]
+        for a, cl in slots_found[1:]:
+            add(m_arc, a, 14)
+            if m_cl is not None and cl is not None:
+                add(m_cl, cl, 14)
     return made
 
 
@@ -737,7 +961,26 @@ def _clone_base_flange(app, sfeat, tdoc, tsketch, is_tab):
                     True, 1, th / 2, th / 2, 0.5, True, bool(is_tab), not is_tab, True)
     if res is None:
         raise SWError("InsertSheetMetalBaseFlange2 returned None")
-    return str(slip._inv(res, "Name"))
+    tname = str(slip._inv(res, "Name"))
+    _copy_props(sfeat, tname, "IBaseFlangeFeatureData", _FLANGE_KEYS)
+    return tname
+
+
+_FLANGE_KEYS = ("OffsetDirections", "D1OffsetType", "D1OffsetDistance", "D2OffsetType", "D2OffsetDistance",
+                "ReverseDirection", "D1ReverseOffset", "D2ReverseOffset", "ReverseThickness",
+                "UseGaugeTable", "GaugeTablePath", "ThicknessTableName", "OverrideThickness", "Thickness",
+                "OverrideRadius", "BendRadius", "OverrideKFactor", "KFactor", "UseDefaultBendRelief",
+                "ReliefType", "UseReliefRatio", "ReliefRatio", "ReliefWidth", "ReliefDepth")
+
+
+def _copy_props(sfeat, tname, iface, keys):
+    """Copy scalar definition properties from the source feature onto the target feature."""
+    d = slip._inv(sfeat, "GetDefinition")
+    props = sw_w._dump_props(d, 0, iface)
+    want = {k: props[k] for k in keys if k in props and isinstance(props[k], (int, float, str, bool))}
+    if not want:
+        return {}
+    return _try(lambda: sw_w._set_feature_properties(tname, want), {})
 
 
 def _clone_member(app, sfeat, sdoc, tdoc, tsketch):
@@ -791,7 +1034,7 @@ def read_source_sketch(source: str, sketch: str) -> dict:
     app = _app()
     src = _read_sketch(app, _doc(source), sketch)
     rows = [{k: v for k, v in r.items() if k not in ("fmt",)} for r in src["rows"]]
-    return {"plane": src["plane"], "points": [[round(v * _MM, 4) for v in p] for p in src["P"]],
+    return {"timing": src["timing"], "plane": src["plane"], "points": [[round(v * _MM, 4) for v in p] for p in src["P"]],
             "segments": rows, "lone_points": src["lone"], "relations": src["rels"],
             "dims": src["dims"], "slots": src["slots"],
             "x_axis": src["x_axis"], "y_axis": src["y_axis"]}
@@ -895,3 +1138,96 @@ def rename_like_source(source: str, mapping: dict) -> dict:
         slip._put(f, "Name", s)
         done.append(s)
     return {"status": "done", "renamed": done}
+
+
+def _ref_entity(sk):
+    """ISketch.GetReferenceEntity(out long type) -> (entity, type) via InvokeTypes (byref out)."""
+    import pythoncom
+    ole = slip._ole(sk)
+    dispid = ole.GetIDsOfNames(0, "GetReferenceEntity")
+    r = ole.InvokeTypes(dispid, 0, pythoncom.DISPATCH_METHOD, (pythoncom.VT_DISPATCH, 0),
+                        ((pythoncom.VT_I4 | pythoncom.VT_BYREF, 2),), 0)
+    ent, typ = (r[0], r[1]) if isinstance(r, tuple) else (r, None)
+    return (slip._wrap(ent) if ent is not None else None), typ
+
+
+def probe_sketch_ref(source: str, sketch: str) -> dict:
+    """Debug: how the sketch plane / face can be read."""
+    sdoc = _doc(source)
+    feat = sw_w._feature(sdoc, sketch)
+    sk = slip._inv(feat, "GetSpecificFeature2")
+    out = {}
+    for label, fn in (
+        ("GetReferenceEntity(0)", lambda: slip._inv(sk, "GetReferenceEntity", 0)),
+        ("GetReferenceEntity()", lambda: slip._inv(sk, "GetReferenceEntity")),
+        ("attr", lambda: sk.GetReferenceEntity(0)),
+        ("byref", lambda: _ref_entity(sk)),
+        ("parents", lambda: [str(slip._inv(p, "Name")) for p in list(slip._inv(feat, "GetParents") or ())]),
+    ):
+        try:
+            v = fn()
+            out[label] = repr(v)[:200]
+        except Exception as ex:  # noqa: BLE001
+            out[label] = "ERR " + str(ex)[:160]
+    return out
+
+
+def dump_source_feature(source: str, feature: str, depth: int = 1, interface: str = "") -> dict:
+    """Debug: the definition properties of a feature of an open source document."""
+    sdoc = _doc(source)
+    f = sw_w._feature(sdoc, feature)
+    d = slip._inv(f, "GetDefinition")
+    from win32com.client import VARIANT
+    import pythoncom
+    _try(lambda: slip._inv(d, "AccessSelections", sdoc, VARIANT(pythoncom.VT_DISPATCH, None)))
+    try:
+        iface = interface or getattr(sw_w, "_DEF_HINT", {}).get(_ftype(f), "") or sw_w._object_interface(d)
+        return {"type": _ftype(f), "interface": iface, "props": sw_w._dump_props(d, depth, iface)}
+    finally:
+        _try(lambda: slip._inv(d, "ReleaseSelectionAccess"))
+
+
+def close_doc(title: str) -> dict:
+    """Close an open document without saving (scratch parts)."""
+    app = _app()
+    slip._inv(app, "CloseDoc", title)
+    return {"status": "done", "closed": title}
+
+
+def new_part() -> dict:
+    """Open a new part from the default part template; returns its title."""
+    app = _app()
+    tpl = str(slip._inv(app, "GetUserPreferenceStringValue", 8))      # swDefaultTemplatePart
+    doc = slip._inv(app, "NewDocument", tpl, 0, 0.0, 0.0)
+    if doc is None:
+        raise SWError(f"NewDocument failed ({tpl})")
+    return {"status": "done", "title": str(slip._inv(doc, "GetTitle")), "template": tpl}
+
+
+def bench(source: str = "", n: int = 50) -> dict:
+    """Debug: COM call latency."""
+    import time
+    app = _app()
+    out = {}
+    t = time.time()
+    for _ in range(n):
+        slip._inv(app, "RevisionNumber")
+    out["app.RevisionNumber_ms"] = round((time.time() - t) / n * 1000, 2)
+    t = time.time()
+    for _ in range(n):
+        app.RevisionNumber
+    out["app.RevisionNumber_attr_ms"] = round((time.time() - t) / n * 1000, 2)
+    if source:
+        d = _doc(source)
+        f = slip._inv(d, "FirstFeature")
+        t = time.time()
+        for _ in range(n):
+            slip._inv(f, "Name")
+        out["feature.Name_ms"] = round((time.time() - t) / n * 1000, 2)
+        t = time.time()
+        _features(d)
+        out["features_walk_s"] = round(time.time() - t, 2)
+        t = time.time()
+        _doc(source)
+        out["_doc_s"] = round(time.time() - t, 2)
+    return out

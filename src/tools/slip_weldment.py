@@ -282,7 +282,10 @@ def _set_feature_properties(feature_name, props, interface=""):
                 before[k] = slip._inv(d, k)
             except Exception:  # noqa: BLE001
                 before[k] = None
-            slip._put(d, k, v)
+            try:
+                slip._put(d, k, v)
+            except Exception as ex:  # noqa: BLE001
+                log.append(f"put {k}: {str(ex)[:60]}")
         # K-factor lives in the custom bend allowance object (a plain KFactor put does not stick)
         if "KFactor" in props:
             try:
