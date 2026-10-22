@@ -389,11 +389,20 @@ def _insert_section_view(
         pos_x = outline[2] + 0.05  # 右邊 + 50mm
         pos_y = (outline[1] + outline[3]) / 2  # 垂直居中
 
-    # 剖面線座標 mm -> meters
+    # 剖面線座標 mm -> meters, then SHEET -> VIEW-SKETCH space: a line sketched in an active view is
+    # read as (sheet - view.Position) / view scale (107045, 2026-10-21: sheet coords passed straight
+    # through put the cutting line 0.2 m off the part -> a 'section' with no cut, no hatch, line off-sheet).
     start_x = section_line["start"]["x"] * _MM_TO_M
     start_y = section_line["start"]["y"] * _MM_TO_M
     end_x = section_line["end"]["x"] * _MM_TO_M
     end_y = section_line["end"]["y"] * _MM_TO_M
+    try:
+        vpos = view_obj.Position
+        vsc = float(view_obj.ScaleDecimal)
+        start_x, start_y = (start_x - vpos[0]) / vsc, (start_y - vpos[1]) / vsc
+        end_x, end_y = (end_x - vpos[0]) / vsc, (end_y - vpos[1]) / vsc
+    except Exception as e:  # noqa: BLE001
+        logger.warning("section line sheet->view transform failed: %s", e)
 
     # COM 流程
     if not drawing.ActivateView(parent_view):

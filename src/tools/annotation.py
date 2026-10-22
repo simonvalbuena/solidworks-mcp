@@ -245,7 +245,7 @@ def _discover_view_names(drawing) -> list[str]:
 
 _VIEW_FEATURE_TYPES = (
     "AbsoluteView", "UnfoldedView", "DrDrawingView",
-    "DetailView", "SectionView", "AuxiliaryView", "RelativeView", "ProjectedView",
+    "DetailView", "SectionView", "SectionPartView", "SectionAssemView", "AuxiliaryView", "RelativeView", "ProjectedView",
 )
 
 
@@ -261,6 +261,39 @@ def _com_prop_or_method(obj, name):
         return getattr(obj, name)()
     except Exception:
         return None
+
+
+def _collect_child_views(parent_feat, view_name, results, depth=0):
+    """Views nested under a view feature (Section View A-A under its parent drawing view)."""
+    if depth > 4:
+        return
+    try:
+        sub = _com_prop_or_method(parent_feat, "GetFirstSubFeature")
+    except Exception:  # noqa: BLE001
+        return
+    while sub is not None:
+        try:
+            st = sub.GetTypeName2
+            sn = sub.Name
+        except Exception:  # noqa: BLE001
+            break
+        if st in _VIEW_FEATURE_TYPES:
+            if view_name is None or sn == view_name:
+                view_obj = None
+                try:
+                    view_obj = sub.GetSpecificFeature2()
+                except Exception:  # noqa: BLE001
+                    try:
+                        view_obj = sub.GetSpecificFeature2
+                    except Exception:  # noqa: BLE001
+                        view_obj = None
+                if view_obj is not None and all(n != sn for n, _ in results):
+                    results.append((sn, view_obj))
+            _collect_child_views(sub, view_name, results, depth + 1)
+        try:
+            sub = _com_prop_or_method(sub, "GetNextSubFeature")
+        except Exception:  # noqa: BLE001
+            break
 
 
 def _get_drawing_views(
@@ -301,6 +334,8 @@ def _get_drawing_views(
                                 view_obj = None
                         if view_obj is not None:
                             results.append((sn, view_obj))
+                    # section / detail views live UNDER their parent view feature (107045, 2026-10-21)
+                    _collect_child_views(sub, view_name, results)
                 sub = _com_prop_or_method(sub, "GetNextSubFeature")
         try:
             feat = feat.GetNextFeature  # 屬性

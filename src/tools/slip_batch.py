@@ -947,11 +947,14 @@ def _add_dimensions(view_name: str, dims: list[dict]) -> dict:
             except Exception:  # noqa: BLE001
                 pass
             if d.get("arc_max"):
-                # line <-> arc: measure to the arc's far tangent point (swArcConditionMax = 2), not its centre
+                # line <-> arc: measure to the arc's far tangent point, not its centre.
+                # SetArcEndCondition lives on IDimension (not IDisplayDimension) and returns 0 on
+                # success; swArcEndCondition_e: 1 centre, 2 MIN, 3 MAX (fixed 2026-10-21, 107045).
                 ok_arc = False
                 for idx in (1, 2):
                     try:
-                        ok_arc = bool(disp.SetArcEndCondition(idx, 2)) or ok_arc
+                        dim_obj = slip._wrap(disp.GetDimension2(0))
+                        ok_arc = (slip._inv(dim_obj, "SetArcEndCondition", idx, 3) == 0) or ok_arc
                     except Exception as ex:  # noqa: BLE001
                         logger.info("SetArcEndCondition(%s): %s", idx, ex)
                 if ok_arc:
